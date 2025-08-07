@@ -15,14 +15,15 @@ jobs:
       - run:
           name: Install curl and uv
           command: |
-            apt-get update && apt-get install -y curl
+            apt-get update && apt-get install -y curl build-essential
             curl -Ls https://astral.sh/uv/install.sh | bash
             echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> $BASH_ENV
             source $BASH_ENV
+            which uv
             uv --version
 
       - run:
-          name: Create and install with uv
+          name: Create venv and install dependencies with uv
           command: |
             source $BASH_ENV
             uv venv
