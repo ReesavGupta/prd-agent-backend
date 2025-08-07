@@ -1,0 +1,40 @@
+version: 2.1
+
+executors:
+  python-executor:
+    docker:
+      - image: python:3.11-slim
+    working_directory: ~/repo
+
+jobs:
+  test:
+    executor: python-executor
+    steps:
+      - checkout
+
+      - run:
+          name: Install uv
+          command: |
+            curl -Ls https://astral.sh/uv/install.sh | bash
+            export PATH="$HOME/.cargo/bin:$PATH"
+            uv --version
+
+      - run:
+          name: Create and install with uv
+          command: |
+            uv venv
+            source .venv/bin/activate
+            uv pip install pytest
+            uv pip install -r requirements.txt || uv pip install .
+
+      - run:
+          name: Run tests with pytest
+          command: |
+            source .venv/bin/activate
+            pytest
+
+workflows:
+  version: 2
+  test-workflow:
+    jobs:
+      - test
