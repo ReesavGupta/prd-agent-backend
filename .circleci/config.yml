@@ -1,44 +1,40 @@
 version: 2.1
 
-executors:
-  python-executor:
-    docker:
-      - image: python:3.11-slim
-    working_directory: ~/repo
-
 jobs:
-  test:
-    executor: python-executor
+  build:
+    docker:
+      - image: cimg/python:3.12  # Use a Python version matching your local setup
     steps:
       - checkout
 
       - run:
-          name: Install curl and uv
+          name: Install curl
           command: |
-            apt-get update && apt-get install -y curl build-essential
-            curl -Ls https://astral.sh/uv/install.sh | bash
-            echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> $BASH_ENV
-            source $BASH_ENV
-            which uv
-            uv --version
+            sudo apt-get update
+            sudo apt-get install -y curl
 
       - run:
-          name: Create venv and install dependencies with uv
+          name: Install uv
           command: |
+            curl -Ls https://astral.sh/uv/install.sh | sh
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> $BASH_ENV
             source $BASH_ENV
-            uv venv
-            source .venv/bin/activate
-            uv pip install pytest
-            uv pip install -r requirements.txt || uv pip install .
+
+      - run:
+          name: Confirm uv installed
+          command: uv --version
+
+      - run:
+          name: Install dependencies using pyproject.toml
+          command: |
+            uv pip install .
 
       - run:
           name: Run tests with pytest
-          command: |
-            source .venv/bin/activate
-            pytest
+          command: pytest
 
 workflows:
   version: 2
-  test-workflow:
+  build_and_test:
     jobs:
-      - test
+      - build
