@@ -3,7 +3,7 @@ Security services for password hashing and JWT token management.
 """
 
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -37,13 +37,13 @@ class SecurityService:
         to_encode = data.copy()
         
         if expires_delta:
-            expire = datetime.utcnow() + expires_delta
+            expire = datetime.now(timezone.utc) + expires_delta
         else:
-            expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-        
+            expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+
         to_encode.update({
             "exp": expire,
-            "iat": datetime.utcnow(),
+            "iat": datetime.now(timezone.utc),
             "token_type": "access"
         })
         
@@ -54,11 +54,11 @@ class SecurityService:
     def create_refresh_token(data: Dict[str, Any]) -> str:
         """Create a JWT refresh token."""
         to_encode = data.copy()
-        expire = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-        
+        expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
         to_encode.update({
             "exp": expire,
-            "iat": datetime.utcnow(),
+            "iat": datetime.now(timezone.utc),
             "token_type": "refresh"
         })
         
@@ -71,14 +71,15 @@ class SecurityService:
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
             
-            user_id: str = payload.get("sub")
-            email: str = payload.get("email")
-            token_type: str = payload.get("token_type")
-            exp: datetime = datetime.fromtimestamp(payload.get("exp"))
-            iat: datetime = datetime.fromtimestamp(payload.get("iat"))
-            
-            if user_id is None or email is None:
+            user_id: Optional[str] = payload.get("sub")
+            email: Optional[str] = payload.get("email")
+            token_type: Optional[str] = payload.get("token_type")
+            exp_ts = payload.get("exp")
+            iat_ts = payload.get("iat")
+            if exp_ts is None or iat_ts is None or user_id is None or email is None or token_type is None:
                 return None
+            exp: datetime = datetime.fromtimestamp(exp_ts)
+            iat: datetime = datetime.fromtimestamp(iat_ts)
                 
             token_data = TokenData(
                 user_id=user_id,
@@ -101,7 +102,7 @@ class SecurityService:
     @staticmethod
     def is_token_expired(token_data: TokenData) -> bool:
         """Check if a token is expired."""
-        return datetime.utcnow() > token_data.exp
+        return datetime.now(timezone.utc) > token_data.exp
 
     @staticmethod
     def get_token_expiry_seconds(token_type: str = "access") -> int:

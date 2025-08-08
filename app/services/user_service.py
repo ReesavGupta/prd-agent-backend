@@ -3,15 +3,15 @@ User management service with CRUD operations and business logic.
 """
 
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone
+from typing import Optional
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.db.database import get_database
-from app.models.user import UserInDB, UserProfile, TokenBlacklist
+from app.models.user import UserInDB, UserProfile
 from app.schemas.auth import UserRegistration, ChangePassword
-from app.schemas.user import UserProfileUpdate, UserCreate, UserUpdate
+from app.schemas.user import UserProfileUpdate
 from app.services.security import security_service
 from app.core.config import settings
 
@@ -42,18 +42,21 @@ class UserService:
         # Create user profile
         profile = UserProfile(
             first_name=user_data.first_name,
-            last_name=user_data.last_name
+            last_name=user_data.last_name,
+            phone_number=None,
+            bio=None
         )
         
         # Create user document
         user_doc = UserInDB(
             email=user_data.email,
             hashed_password=security_service.hash_password(user_data.password),
-            profile=profile
+            profile=profile,
+            locked_until=None  # or set to a default datetime if required
         )
         
         # Insert user into database
-        result = await db.users.insert_one(user_doc.dict(by_alias=True))
+        result = await db.users.insert_one(user_doc.model_dump(by_alias=True))
         user_doc.id = result.inserted_id
         
         logger.info(f"Created new user: {user_data.email}")
@@ -107,7 +110,7 @@ class UserService:
         
         await db.users.update_one(
             {"_id": user_id},
-            {"$set": {"last_login": datetime.utcnow()}}
+            {"$set": {"last_login": datetime.now(timezone.utc)}}
         )
     
     async def update_user_profile(self, user_id: str, profile_data: UserProfileUpdate) -> Optional[UserInDB]:
@@ -119,14 +122,14 @@ class UserService:
         
         # Prepare update data
         update_data = {}
-        for field, value in profile_data.dict(exclude_unset=True).items():
+        for field, value in profile_data.model_dump(exclude_unset=True).items():
             if value is not None:
                 update_data[f"profile.{field}"] = value
         
         if not update_data:
             return await self.get_user_by_id(user_id)
         
-        update_data["updated_at"] = datetime.utcnow()
+        update_data["updated_at"] = datetime.now(timezone.utc)
         
         # Update user
         await db.users.update_one(
@@ -155,8 +158,8 @@ class UserService:
             {"_id": ObjectId(user_id)},
             {"$set": {
                 "hashed_password": new_hashed_password,
-                "password_changed_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow()
+                "password_changed_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc)
             }}
         )
         

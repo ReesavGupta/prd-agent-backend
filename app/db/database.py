@@ -26,11 +26,14 @@ async def connect_to_mongo():
     try:
         logger.info("Connecting to MongoDB...")
         db.client = AsyncIOMotorClient(settings.MONGODB_URL)
-        db.database = db.client[settings.DATABASE_NAME]
-        
-        # Test the connection
-        await db.client.admin.command('ping')
-        logger.info("Successfully connected to MongoDB")
+        if db.client is not None:
+            db.database = db.client[settings.DATABASE_NAME]
+            # Test the connection
+            await db.client.admin.command('ping')
+            logger.info("Successfully connected to MongoDB")
+        else:
+            logger.error("MongoDB client is not initialized.")
+            raise RuntimeError("MongoDB client is not initialized.")
         
         # Create indexes
         await create_indexes()

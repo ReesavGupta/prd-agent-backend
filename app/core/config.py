@@ -4,7 +4,7 @@ Handles environment-based configuration for database connections, JWT secrets, a
 """
 
 from typing import Optional, List
-from pydantic import validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 import secrets
 
@@ -51,21 +51,21 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     
-    @validator("SECRET_KEY")
+    @field_validator("SECRET_KEY")
     def validate_secret_key(cls, v):
         """Ensure secret key is sufficiently long."""
         if len(v) < 32:
             raise ValueError("SECRET_KEY must be at least 32 characters long")
         return v
     
-    @validator("MONGODB_URL")
+    @field_validator("MONGODB_URL")
     def validate_mongodb_url(cls, v):
         """Validate MongoDB URL format."""
         if not v.startswith(("mongodb://", "mongodb+srv://")):
             raise ValueError("MONGODB_URL must start with 'mongodb://' or 'mongodb+srv://'")
         return v
     
-    @validator("PASSWORD_MIN_LENGTH")
+    @field_validator("PASSWORD_MIN_LENGTH")
     def validate_password_min_length(cls, v):
         """Ensure minimum password length is reasonable."""
         if v < 6:

@@ -2,7 +2,7 @@
 User model for MongoDB with proper schema design and extensibility.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, EmailStr
 from bson import ObjectId
@@ -35,7 +35,7 @@ class UserRole(BaseModel):
     
     name: str = Field(..., description="Role name")
     permissions: List[str] = Field(default_factory=list, description="List of permissions")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class UserProfile(BaseModel):
@@ -62,20 +62,25 @@ class UserInDB(BaseModel):
     is_superuser: bool = Field(default=False, description="Whether user has admin privileges")
     
     # Extended profile
-    profile: UserProfile = Field(default_factory=UserProfile)
+    profile: UserProfile = Field(default_factory=lambda: UserProfile(
+        first_name=None,
+        last_name=None,
+        phone_number=None,
+        bio=None
+    ))
     
     # Role-based access control (for future use)
     roles: List[UserRole] = Field(default_factory=list, description="User roles")
     
     # Timestamps
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_login: Optional[datetime] = None
     
     # Security fields
     failed_login_attempts: int = Field(default=0, description="Number of consecutive failed login attempts")
     locked_until: Optional[datetime] = Field(None, description="Account lock expiration time")
-    password_changed_at: datetime = Field(default_factory=datetime.utcnow)
+    password_changed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     # Metadata
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional user metadata")
@@ -106,7 +111,7 @@ class TokenBlacklist(BaseModel):
     token: str = Field(..., description="JWT token to blacklist")
     user_id: PyObjectId = Field(..., description="User ID who owns the token")
     expires_at: datetime = Field(..., description="Token expiration time")
-    blacklisted_at: datetime = Field(default_factory=datetime.utcnow)
+    blacklisted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     reason: Optional[str] = Field(None, description="Reason for blacklisting")
 
     class Config:

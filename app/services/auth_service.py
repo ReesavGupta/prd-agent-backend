@@ -147,7 +147,7 @@ class AuthService:
             reason=reason
         )
         
-        await db.token_blacklist.insert_one(blacklist_entry.dict(by_alias=True))
+        await db.token_blacklist.insert_one(blacklist_entry.model_dump(by_alias=True))
     
     async def is_token_blacklisted(self, token: str) -> bool:
         """Check if token is blacklisted."""
