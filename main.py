@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.db.database import connect_to_mongo, close_mongo_connection
-from app.api import auth_router, users_router
+from app.api import auth_router, users_router, projects_router
 
 # Configure logging
 logging.basicConfig(
@@ -30,12 +30,20 @@ async def lifespan(app):
     # Startup
     logger.info("Starting up...")
     await connect_to_mongo()
+    
+    # Initialize database indexes
+    from app.dependencies import get_project_repository, cleanup_dependencies
+    project_repo = get_project_repository()
+    await project_repo.create_indexes()
+    logger.info("Database indexes created")
+    
     logger.info("Application startup complete")
 
     yield
 
     # Shutdown
     logger.info("Shutting down...")
+    await cleanup_dependencies()
     await close_mongo_connection()
     logger.info("Application shutdown complete")
 
@@ -88,6 +96,11 @@ app.include_router(
 
 app.include_router(
     users_router,
+    prefix="/api/v1"
+)
+
+app.include_router(
+    projects_router,
     prefix="/api/v1"
 )
 

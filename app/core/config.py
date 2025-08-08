@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     """Application settings with environment variable support."""
     
     # Application settings
-    APP_NAME: str = "Authentication API"
+    APP_NAME: str = "AI PRD Generator API"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
     
@@ -36,11 +36,19 @@ class Settings(BaseSettings):
     
     # Database settings
     MONGODB_URL: str = "mongodb://localhost:27017"
-    DATABASE_NAME: str = "auth_db"
+    DATABASE_NAME: str = "ai_prd_generator"
     
-    # Rate limiting settings removed
+    # Redis settings
+    REDIS_URL: str = "redis://localhost:6379"
+    REDIS_DB: int = 0
+    CACHE_TTL: int = 3600  # 1 hour default cache TTL
     
-    # Email settings removed (were for password reset functionality)
+    # Cloudinary settings
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
+    CLOUDINARY_FOLDER_PREFIX: str = "ai-prd-generator"
+    CLOUDINARY_SECURE_URL: bool = True
     
     # CORS settings
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:5173"]
@@ -70,6 +78,13 @@ class Settings(BaseSettings):
         """Ensure minimum password length is reasonable."""
         if v < 6:
             raise ValueError("PASSWORD_MIN_LENGTH must be at least 6")
+        return v
+    
+    @field_validator("REDIS_URL")
+    def validate_redis_url(cls, v):
+        """Validate Redis URL format."""
+        if not v.startswith("redis://") and not v.startswith("rediss://"):
+            raise ValueError("REDIS_URL must start with 'redis://' or 'rediss://'")
         return v
     
     class Config:

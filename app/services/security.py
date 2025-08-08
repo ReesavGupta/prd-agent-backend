@@ -70,7 +70,6 @@ class SecurityService:
         """Verify and decode a JWT token."""
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-            
             user_id: Optional[str] = payload.get("sub")
             email: Optional[str] = payload.get("email")
             token_type: Optional[str] = payload.get("token_type")
@@ -78,8 +77,8 @@ class SecurityService:
             iat_ts = payload.get("iat")
             if exp_ts is None or iat_ts is None or user_id is None or email is None or token_type is None:
                 return None
-            exp: datetime = datetime.fromtimestamp(exp_ts)
-            iat: datetime = datetime.fromtimestamp(iat_ts)
+            exp: datetime = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+            iat: datetime = datetime.fromtimestamp(iat_ts, tz=timezone.utc)
                 
             token_data = TokenData(
                 user_id=user_id,
