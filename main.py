@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.db.database import connect_to_mongo, close_mongo_connection
-from app.api import auth_router, users_router, projects_router, ai_router
+from app.api import auth_router, users_router, projects_router, ai_router, chats_router, websocket_router
 
 # Configure logging
 logging.basicConfig(
@@ -107,6 +107,16 @@ app.include_router(
 app.include_router(
     ai_router,
     prefix="/api/v1"
+)
+
+app.include_router(
+    chats_router,
+    prefix="/api/v1"
+)
+
+app.include_router(
+    websocket_router,
+    prefix="/ws"
 )
 
 

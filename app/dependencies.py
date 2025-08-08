@@ -33,6 +33,11 @@ def get_cache_repository() -> RedisCacheRepository:
     return _cache_repository
 
 
+def get_cloudinary_storage() -> CloudinaryStorageRepository:
+    """Get Cloudinary storage repository instance."""
+    return get_storage_repository()
+
+
 def get_project_repository() -> ProjectRepository:
     """Get project repository instance."""
     database = get_database()

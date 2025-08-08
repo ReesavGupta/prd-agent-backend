@@ -84,7 +84,44 @@ async def create_indexes():
         # TTL index on expires_at for automatic cleanup
         await token_blacklist_collection.create_index("expires_at", expireAfterSeconds=0)
         
-        # Password reset tokens collection indexes removed
+        # Chat collection indexes
+        chats_collection = db.database.chats
+        
+        # Index on user_id + status for listing user chats
+        await chats_collection.create_index([("user_id", 1), ("status", 1)])
+        
+        # Index on user_id + updated_at for sorting by activity
+        await chats_collection.create_index([("user_id", 1), ("updated_at", -1)])
+        
+        # Index on last_message_at for global chat ordering
+        await chats_collection.create_index("last_message_at")
+        
+        # Messages collection indexes
+        messages_collection = db.database.messages
+        
+        # Index on chat_id + timestamp for message pagination
+        await messages_collection.create_index([("chat_id", 1), ("timestamp", 1)])
+        
+        # Index on user_id + timestamp for user message history
+        await messages_collection.create_index([("user_id", 1), ("timestamp", -1)])
+        
+        # Index on timestamp for global message ordering
+        await messages_collection.create_index("timestamp")
+        
+        # Index on is_deleted for filtering
+        await messages_collection.create_index("is_deleted")
+        
+        # Chat sessions collection indexes
+        chat_sessions_collection = db.database.chat_sessions
+        
+        # Unique index on session_id for WebSocket management
+        await chat_sessions_collection.create_index("session_id", unique=True)
+        
+        # Index on chat_id + user_id for session lookups
+        await chat_sessions_collection.create_index([("chat_id", 1), ("user_id", 1)])
+        
+        # TTL index on expires_at for automatic cleanup
+        await chat_sessions_collection.create_index("expires_at", expireAfterSeconds=0)
         
         logger.info("Database indexes created successfully")
         
