@@ -2,7 +2,7 @@
 Application configuration management using Pydantic Settings.
 Handles environment-based configuration for database connections, JWT secrets, and other settings.
 """
-
+import os
 from typing import Optional, List
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     DATABASE_NAME: str = "ai_prd_generator"
     
     # Redis settings
-    REDIS_URL: str = "redis://localhost:6379"
+    REDIS_URL: Optional[str] = os.getenv("REDIS_URL")
     REDIS_DB: int = 0
     CACHE_TTL: int = 3600  # 1 hour default cache TTL
     
@@ -54,6 +54,29 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:5173"]
     ALLOWED_METHODS: List[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     ALLOWED_HEADERS: List[str] = ["*"]
+    
+    # AI Provider settings
+    GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY") 
+    GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
+    OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY") 
+    
+    # AI Configuration
+    PRIMARY_AI_PROVIDER: str = "gemini"
+    SECONDARY_AI_PROVIDER: str = "groq"
+    TERTIARY_AI_PROVIDER: str = "openai"
+    
+    # AI Rate Limiting (requests per minute per user)
+    AI_RATE_LIMIT_PER_USER: int = 50
+    AI_RATE_LIMIT_WINDOW_MINUTES: int = 1
+    
+    # AI Response Configuration
+    AI_MAX_TOKENS: int = 4000
+    AI_TEMPERATURE: float = 0.7
+    AI_TIMEOUT_SECONDS: int = 60
+    
+    # Streaming Configuration
+    AI_STREAM_CHUNK_SIZE: int = 1024
+    AI_STREAM_TIMEOUT: int = 120
     
     # Logging settings
     LOG_LEVEL: str = "INFO"
