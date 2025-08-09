@@ -212,6 +212,107 @@ def _replace_section_body(prd_markdown: str, target_section: str, new_body: str)
     return result
 
 
+def _section_to_lens(section: str) -> str:
+    key = _canonicalize_heading_key(section)
+    if key.startswith("1. "):
+        return "discovery"
+    if key.startswith("2. "):
+        return "metrics"
+    if key.startswith("3. "):
+        return "discovery"
+    if key.startswith("4. "):
+        return "discovery"
+    if key.startswith("5. "):
+        return "user_journey"
+    if key.startswith("6. "):
+        return "risks"
+    if key.startswith("7. "):
+        return "user_journey"
+    if key.startswith("8. "):
+        return "risks"
+    if key.startswith("9. "):
+        return "risks"
+    if key.startswith("10. "):
+        return "gtm"
+    if key.startswith("11. "):
+        return "metrics"
+    if key.startswith("12. "):
+        return "metrics"
+    if key.startswith("13. "):
+        return "risks"
+    if key.startswith("14. "):
+        return "gtm"
+    return "discovery"
+
+
+def _detect_domain(idea_text: str) -> tuple[str, str]:
+    t = (idea_text or "").lower()
+    # Heuristic domain detection
+    dev_markers = ("cursor", "code", "coding", "ide", "editor", "repo", "git", "developer", "copilot")
+    fitness_markers = ("fitness", "workout", "health", "steps", "calorie", "weight")
+    if any(m in t for m in dev_markers):
+        return ("ai_coding_assistant", "an AI coding assistant for developers")
+    if any(m in t for m in fitness_markers):
+        return ("fitness_tracker", "a fitness tracker")
+    return ("general", "a product")
+
+
+def _domain_hints(domain_slug: str) -> str:
+    if domain_slug == "ai_coding_assistant":
+        return "languages, editors, latency targets, repo indexing, privacy, model choice, context sources, on-device vs cloud"
+    if domain_slug == "fitness_tracker":
+        return "primary goals, devices, sensors, integrations, data privacy, battery life, sync reliability"
+    return "key decisions, scope, constraints relevant to the product domain"
+
+
+def _domain_specific_fallback_question(section: str, domain_slug: str) -> str:
+    s = _canonicalize_heading_key(section)
+    if domain_slug == "ai_coding_assistant":
+        if s.startswith("1. "):
+            return "Which developer workflows will v1 focus on (e.g., inline completions, refactor, chat in editor)?"
+        if s.startswith("2. "):
+            return "What 2–3 measurable v1 targets will we hit (e.g., p95 latency ≤ 200ms, ≥ 60% suggestion acceptance)?"
+        if s.startswith("3. "):
+            return "Which roles/editors are in scope first (e.g., JS full‑stack in VS Code, Python ML in JetBrains)?"
+        if s.startswith("4. "):
+            return "What top pain points in the coding flow must v1 solve (e.g., context hopping, test scaffolding)?"
+        if s.startswith("5. "):
+            return "Which must‑have v1 features and language/editor scope are required to deliver value?"
+        if s.startswith("6. "):
+            return "What latency, privacy, and enterprise constraints must v1 meet (p95 targets, data boundaries)?"
+        if s.startswith("7. "):
+            return "What is the happy‑path from writing code to applying suggestions and verifying changes?"
+        if s.startswith("8. "):
+            return "Which context sources, model family, and indexing approach will we use (repo size, monorepos)?"
+        if s.startswith("11. "):
+            return "Which success metrics matter most (suggestion acceptance, task time saved, p95 latency, crash‑free %)?"
+        if s.startswith("12. "):
+            return "What release criteria must v1 pass (supported languages/editors, p95 latency, reliability)?"
+    if domain_slug == "fitness_tracker":
+        if s.startswith("1. "):
+            return "Which primary use case will v1 target (weight loss, cardio, strength) and on which platforms?"
+        if s.startswith("2. "):
+            return "What 2–3 measurable v1 goals will we track (DAU, day‑7 retention, goal adherence)?"
+        if s.startswith("3. "):
+            return "Who are the first personas (e.g., beginners, busy professionals) and their key constraints?"
+        if s.startswith("5. "):
+            return "Which must‑have v1 features deliver value (activity tracking, goals, reminders, social)?"
+        if s.startswith("6. "):
+            return "What NFRs matter most (battery life, data privacy, sync reliability)?"
+        if s.startswith("8. "):
+            return "Which sensors and integrations are needed (Apple Health/Google Fit), and what tech stack?"
+        if s.startswith("11. "):
+            return "Which metrics define success (active days/week, goal adherence, retention)?"
+    # General fallback by lens
+    lens = _section_to_lens(section)
+    if lens == "metrics" and s.startswith("2. "):
+        return "What 2–3 measurable v1 targets will define success (include numeric thresholds and timeframe)?"
+    if lens == "user_journey" and s.startswith("5. "):
+        return "Which 5–8 core features are essential for v1 and why?"
+    if lens == "discovery" and s.startswith("1. "):
+        return "What core value does the product deliver and who is the primary user?"
+    return f"{section}: what specific details should we capture here?"
+
 def _system_prompt_initial_outline(template_text: str, title: str) -> str:
     """Prompt the model to output ONLY the outline based on the canonical template."""
     return (
@@ -531,7 +632,7 @@ async def propose_next_question(state: AgentState) -> AgentState:
         state.pending_question = None
         return state
 
-    # Deterministic question templates per section
+    # Deterministic base as fallback
     qmap: Dict[str, str] = {
         "1. Product Overview / Purpose": "what is the core product and primary value proposition, and who is it primarily for?",
         "2. Objective and Goals": "what are the 2–3 concrete goals for the first release, and how will we know we've succeeded?",
@@ -549,8 +650,100 @@ async def propose_next_question(state: AgentState) -> AgentState:
         "14. Budget and Resources": "what budget or resource constraints should we assume?",
     }
     base = qmap.get(target, f"what details do you want to include in the {target} section?")
-    # Keep the question crisp and direct
-    phrased = f"{target}: {base}"
+
+    # Try generating a tailored, idea-specific question using current context
+    idea_text = (state.idea or "").strip()
+    try:
+        s_idx, e_idx, lines, _h = _find_section_range(state.prd_markdown, target)
+        existing_body = "\n".join(lines[s_idx:e_idx]).strip() if s_idx != -1 else ""
+    except Exception:
+        existing_body = ""
+    # Include last 2 Q/As as context
+    recent_qa = state.answered_qa[-2:] if isinstance(state.answered_qa, list) else []
+
+    def _is_valid_question(text: str) -> bool:
+        t = (text or "").strip()
+        if not t or t == "?":
+            return False
+        # must include at least one alphabetic character
+        if not any(ch.isalpha() for ch in t):
+            return False
+        # minimal length to avoid trivial outputs
+        if len(t) < 12:
+            return False
+        return True
+
+    def _tailored_fallback(idea: str, sec: str, generic: str) -> str:
+        idea_short = (idea or "this product").strip()
+        if len(idea_short) > 60:
+            idea_short = idea_short[:60].rstrip() + "…"
+        # Domain- and lens-aware fallback
+        domain_slug, domain_label = _detect_domain(idea)
+        domain_q = _domain_specific_fallback_question(sec, domain_slug)
+        if domain_q and not domain_q.startswith(sec):
+            return domain_q
+        # Default tailored wrapper
+        return f"{sec}: For '{idea_short}', {generic}"
+
+    specialized_q: Optional[str] = None
+    try:
+        sys = {
+            "role": "system",
+            "content": (
+                "Write ONE specific, concise question to elicit the most useful information to complete the given PRD section. "
+                "Tailor it to the product idea and current draft. Constraints: 1 question only; ≤ 160 chars; no preface, no numbering, no quotes; end with '?'."
+            ),
+        }
+        ctx_parts: List[str] = []
+        if idea_text:
+            ctx_parts.append(f"Idea: {idea_text}")
+        ctx_parts.append(f"Section: {target}")
+        if existing_body:
+            body_trim = existing_body.strip()
+            if len(body_trim) > 700:
+                body_trim = body_trim[:700]
+            ctx_parts.append(f"Existing section draft:\n{body_trim}")
+        if recent_qa:
+            # format the last QAs compactly
+            qa_lines = []
+            for qa in recent_qa:
+                q = (qa.get("question") or "").strip()
+                a = (qa.get("answer") or "").strip()
+                if q and a:
+                    qa_lines.append(f"- Q: {q} | A: {a}")
+            if qa_lines:
+                ctx_parts.append("Recent answers:\n" + "\n".join(qa_lines))
+        usr = {"role": "user", "content": "\n\n".join(ctx_parts)}
+        resp = await ai_service.generate_response(
+            user_id=state.user_id,
+            messages=[sys, usr],
+            temperature=0.2,
+            max_tokens=80,
+            use_cache=False,
+        )
+        candidate = (resp.content or "").strip()
+        # sanitize
+        candidate = candidate.strip().strip('\'"')  # remove stray single/double quotes at both ends
+        # If multiple lines, take first non-empty line
+        if "\n" in candidate:
+            for line in candidate.splitlines():
+                lt = line.strip()
+                if lt:
+                    candidate = lt
+                    break
+        if not candidate.endswith("?"):
+            candidate = candidate.rstrip(". ") + "?"
+        if len(candidate) > 200:
+            candidate = candidate[:200].rstrip() + "?"
+        # Validate; reject trivial outputs like '?' or empty
+        specialized_q = candidate if _is_valid_question(candidate) else None
+    except Exception:
+        specialized_q = None
+
+    if specialized_q:
+        phrased = specialized_q
+    else:
+        phrased = _tailored_fallback(idea_text, target, base) if idea_text else f"{target}: {base}"
     state.pending_question = {
         "id": f"sec_{order.index(target)+1}",
         "question": phrased,
