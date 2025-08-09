@@ -51,7 +51,13 @@ class Settings(BaseSettings):
     CLOUDINARY_SECURE_URL: bool = True
     
     # CORS settings
-    ALLOWED_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:5173"]
+    ALLOWED_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://0.0.0.0:8080",
+    ]
     ALLOWED_METHODS: List[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     ALLOWED_HEADERS: List[str] = ["*"]
     
@@ -64,6 +70,11 @@ class Settings(BaseSettings):
     PRIMARY_AI_PROVIDER: str = "gemini"
     SECONDARY_AI_PROVIDER: str = "groq"
     TERTIARY_AI_PROVIDER: str = "openai"
+
+    # Model names (configurable via env)
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama3-70b-8192")
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     
     # AI Rate Limiting (requests per minute per user)
     AI_RATE_LIMIT_PER_USER: int = 50
@@ -77,6 +88,10 @@ class Settings(BaseSettings):
     # Streaming Configuration
     AI_STREAM_CHUNK_SIZE: int = 1024
     AI_STREAM_TIMEOUT: int = 120
+
+    # HITL Interrupt/Reminder configuration
+    HITL_INTERRUPT_REMINDER_SECONDS: int = int(os.getenv("HITL_INTERRUPT_REMINDER_SECONDS", "120"))
+    HITL_INTERRUPT_MAX_REMINDERS: int = int(os.getenv("HITL_INTERRUPT_MAX_REMINDERS", "1"))
     
     # Logging settings
     LOG_LEVEL: str = "INFO"

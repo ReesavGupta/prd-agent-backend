@@ -7,12 +7,13 @@ import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
+from app.middleware import timing_middleware
 from fastapi.responses import JSONResponse
 # Rate limiting removed
 
 from app.core.config import settings
 from app.db.database import connect_to_mongo, close_mongo_connection
-from app.api import auth_router, users_router, projects_router, ai_router, chats_router, websocket_router
+from app.api import auth_router, users_router, projects_router, ai_router, chats_router, websocket_router, agent_router
 
 # Configure logging
 logging.basicConfig(
@@ -22,7 +23,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Rate limiting removed
-
 
 @asynccontextmanager
 async def lifespan(app):
@@ -60,14 +60,23 @@ app = FastAPI(
 
 # Rate limiting middleware removed
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
+# Add CORS middleware (dev-friendly)
+cors_kwargs = dict(
     allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=settings.ALLOWED_METHODS,
     allow_headers=settings.ALLOWED_HEADERS,
 )
+# In DEBUG, allow any origin via regex to ease local dev across ports
+if settings.DEBUG:
+    cors_kwargs["allow_origin_regex"] = ".*"
+
+app.add_middleware(CORSMiddleware, **cors_kwargs)
+try:
+    # Add timing header middleware if available
+    app.middleware("http")(timing_middleware)  # type: ignore
+except Exception:
+    pass
 
 
 # Global exception handler
@@ -117,6 +126,11 @@ app.include_router(
 app.include_router(
     websocket_router,
     prefix="/ws"
+)
+
+app.include_router(
+    agent_router,
+    prefix="/api/v1"
 )
 
 

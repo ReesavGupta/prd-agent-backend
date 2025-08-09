@@ -5,6 +5,7 @@ Database connection and configuration for MongoDB.
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from typing import Optional
+import os
 
 from app.core.config import settings
 
@@ -123,6 +124,27 @@ async def create_indexes():
         # TTL index on expires_at for automatic cleanup
         await chat_sessions_collection.create_index("expires_at", expireAfterSeconds=0)
         
+        # LangGraph checkpoint collection indexes (for HITL persistence)
+        try:
+            checkpoint_collection_name = os.getenv("HITL_MONGO_COLLECTION", "langgraph_checkpoints")
+            cp_coll = db.database[checkpoint_collection_name]
+            # Helpful indexes for common resume/list operations
+            await cp_coll.create_index([("thread_id", 1)])
+            await cp_coll.create_index([("thread_id", 1), ("checkpoint_id", -1)])
+            await cp_coll.create_index([("thread_id", 1), ("parent", 1)])
+            # Timestamps vary by implementation; create optional indexes if present
+            try:
+                await cp_coll.create_index([("ts", -1)])
+            except Exception:
+                pass
+            try:
+                await cp_coll.create_index([("created_at", -1)])
+            except Exception:
+                pass
+        except Exception as _e:
+            # Non-fatal; checkpoint saver still works without custom indexes
+            logger.warning("Skipping checkpoint collection index setup: %s", _e)
+
         logger.info("Database indexes created successfully")
         
     except Exception as e:

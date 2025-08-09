@@ -6,13 +6,17 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
+import re
+import asyncio
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.models.user import UserInDB, PyObjectId
 from app.models.chat import ChatSession
 from app.schemas.chat import WebSocketMessageRequest, WebSocketMessageResponse
 from app.services.chat_service import chat_service
+from app.agent.state import AgentState
+from app.agent.runtime import run_iteration, start_run, resume_run
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,53 @@ class WebSocketManager:
         
         # Typing indicators: chat_id -> set of user_ids
         self.typing_users: Dict[str, Set[str]] = {}
+        
+        # Pending agent interrupt per chat (question awaiting answer)
+        self.pending_interrupts: Dict[str, Dict[str, Any]] = {}
+        # Run-in-flight indicator per chat (guards concurrent runs / races)
+        self.run_in_flight: Dict[str, bool] = {}
+
+    # --- Edit command helpers -------------------------------------------------
+    _RENAME_PATTERNS = [
+        re.compile(r"^\s*rename\s+(?:the\s+)?(?:prd\s+)?(?:title\s+)?to\s+(.+)$", re.I),
+        re.compile(r"^\s*change\s+(?:the\s+)?(?:prd\s+)?title\s+(?:to|as)\s+(.+)$", re.I),
+        re.compile(r"^\s*set\s+(?:the\s+)?(?:prd\s+)?title\s+to\s+(.+)$", re.I),
+    ]
+
+    def _extract_rename_title(self, content: str) -> Optional[str]:
+        if not content:
+            return None
+        text = content.strip().strip('"\'')
+        for pat in self._RENAME_PATTERNS:
+            m = pat.match(text)
+            if m:
+                title = m.group(1).strip().strip('"\'')
+                # guard against empty or too short titles
+                if title:
+                    return title
+        return None
+
+    def _rename_prd_title(self, markdown: str, new_title: str) -> str:
+        """Rename or insert top-level PRD title (# Heading) deterministically."""
+        if not new_title:
+            return markdown
+        lines = (markdown or "").splitlines()
+        # Find first non-empty line
+        idx = None
+        for i, line in enumerate(lines):
+            if line.strip():
+                idx = i
+                break
+        if idx is None:
+            return f"# {new_title}\n\n"
+        if lines[idx].lstrip().startswith("#"):
+            # Replace the entire heading line with new title
+            lines[idx] = f"# {new_title}"
+            return "\n".join(lines) + ("\n" if markdown.endswith("\n") else "")
+        # No heading at top; insert new title before first non-empty line
+        prefix = lines[:idx]
+        rest = lines[idx:]
+        return "\n".join(prefix + [f"# {new_title}", ""] + rest)
     
     async def connect(
         self, 
@@ -162,6 +213,9 @@ class WebSocketManager:
             elif message.type == "ping":
                 await self._handle_ping(websocket, session_id)
             
+            elif message.type == "agent_resume":
+                await self._handle_agent_resume(websocket, chat_id, user_id, message.data)
+            
             else:
                 await self._send_error(websocket, f"Unknown message type: {message.type}")
             
@@ -181,6 +235,116 @@ class WebSocketManager:
             content = data.get("content")
             if not content:
                 await self._send_error(websocket, "Message content is required")
+                return
+            
+            # Agent mode: run LangGraph per-message iteration and stream back to sender
+            mode = data.get("mode")
+            if mode == "agent":
+                # If a question is pending for this chat, interpret this message as the answer and resume
+                pending = self.pending_interrupts.get(chat_id)
+                if pending:
+                    try:
+                        # Echo user's answer into chat stream
+                        await self._broadcast_to_chat(chat_id, {
+                            "type": "message_sent",
+                            "data": {
+                                "message_id": str(uuid.uuid4()),
+                                "user_id": user_id,
+                                "content": content,
+                                "timestamp": datetime.utcnow().isoformat(),
+                                "message_type": "user"
+                            }
+                        })
+                        # Clear interrupt and resume the agent thread
+                        await self._broadcast_to_chat(chat_id, {
+                            "type": "agent_interrupt_cleared",
+                            "data": {"question_id": str(pending.get("question_id"))}
+                        })
+                        # Remove pending marker
+                        self.pending_interrupts.pop(chat_id, None)
+                        await resume_run(chat_id, {"type": "answer", "question_id": str(pending.get("question_id")), "text": content})
+                        return
+                    except Exception as e:
+                        logger.error(f"Error auto-resuming pending interrupt: {e}")
+                        # If resume fails, fall back to starting a fresh run below
+
+                # If a run is in-flight but pending hasn't been recorded yet, wait briefly for interrupt
+                if self.run_in_flight.get(chat_id):
+                    try:
+                        await asyncio.sleep(0.15)
+                    except Exception:
+                        pass
+                    pending = self.pending_interrupts.get(chat_id)
+                    if pending:
+                        try:
+                            await self._broadcast_to_chat(chat_id, {
+                                "type": "message_sent",
+                                "data": {
+                                    "message_id": str(uuid.uuid4()),
+                                    "user_id": user_id,
+                                    "content": content,
+                                    "timestamp": datetime.utcnow().isoformat(),
+                                    "message_type": "user"
+                                }
+                            })
+                            await self._broadcast_to_chat(chat_id, {
+                                "type": "agent_interrupt_cleared",
+                                "data": {"question_id": str(pending.get("question_id"))}
+                            })
+                            self.pending_interrupts.pop(chat_id, None)
+                            await resume_run(chat_id, {"type": "answer", "question_id": str(pending.get("question_id")), "text": content})
+                            return
+                        except Exception as e:
+                            logger.error(f"Error resuming after grace wait: {e}")
+                    # Still busy: reject starting a new run to avoid duplicate questions
+                    await self._send_error(websocket, "Agent is busy processing. Please wait for the question to appear, then reply.")
+                    return
+
+                # Build state from client-provided context and stream via this websocket
+                # Apply deterministic edit commands (e.g., rename PRD title) before starting a run
+                base_prd_markdown = (data.get("base_prd_markdown", "") or "")
+                rename_to = self._extract_rename_title(content or "")
+                if rename_to:
+                    try:
+                        # Apply deterministic rename locally
+                        base_prd_markdown = self._rename_prd_title(base_prd_markdown, rename_to)
+                        # If the message is a pure rename command, reflect immediately and do not start a run
+                        if any(pat.match(content or "") for pat in self._RENAME_PATTERNS):
+                            await self._broadcast_to_chat(chat_id, {
+                                "type": "artifacts_preview",
+                                "data": {
+                                    "prd_markdown": base_prd_markdown,
+                                    "mermaid": data.get("base_mermaid", "") or None,
+                                    "thinking_lens_status": data.get("ui_overrides", {}).get("thinking_lens_status") if isinstance(data.get("ui_overrides"), dict) else None,
+                                },
+                            })
+                            # Echo a short assistant confirmation
+                            await self._broadcast_to_chat(chat_id, {
+                                "type": "ai_response_complete",
+                                "data": {
+                                    "message": f"Renamed PRD title to '{rename_to}'",
+                                },
+                            })
+                            return
+                    except Exception as e:
+                        logger.error(f"Failed to apply rename command: {e}")
+
+                state = AgentState(
+                    project_id=str(data.get("project_id", "")),
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    idea=data.get("initial_idea"),
+                    qa=data.get("clarifications") or [],
+                    last_messages=data.get("last_messages") or [],
+                    base_prd_markdown=base_prd_markdown,
+                    base_mermaid=data.get("base_mermaid", "") or "",
+                    attachments=data.get("attachments") or [],
+                    ui_overrides=data.get("ui_overrides") or None,
+                    ws_chat_id=chat_id,
+                    generate_flowchart=bool(data.get("generate_flowchart", False)),
+                )
+                # Use HITL-capable start_run bound to thread_id=chat_id
+                await start_run(state, thread_id=chat_id)
                 return
             
             # Create message request
@@ -227,6 +391,42 @@ class WebSocketManager:
         except Exception as e:
             logger.error(f"Error handling send message: {e}")
             await self._send_error(websocket, "Failed to send message")
+    
+    async def _handle_agent_resume(
+        self,
+        websocket: WebSocket,
+        chat_id: str,
+        user_id: str,
+        data: dict,
+    ) -> None:
+        """Resume an interrupted agent thread with human input."""
+        try:
+            payload = data or {}
+            if "answer" in payload:
+                answer = payload["answer"] or {}
+                if not isinstance(answer, dict) or not answer.get("question_id"):
+                    await self._send_error(websocket, "Invalid resume payload: missing answer.question_id")
+                    return
+                await self._broadcast_to_chat(chat_id, {
+                    "type": "agent_interrupt_cleared",
+                    "data": {"question_id": answer.get("question_id")}
+                })
+                await resume_run(chat_id, {"type": "answer", "question_id": answer.get("question_id"), "text": answer.get("text", "")})
+            elif "accept" in payload:
+                accept = payload["accept"] or {}
+                if not isinstance(accept, dict) or not accept.get("question_id"):
+                    await self._send_error(websocket, "Invalid resume payload: missing accept.question_id")
+                    return
+                await self._broadcast_to_chat(chat_id, {
+                    "type": "agent_interrupt_cleared",
+                    "data": {"question_id": accept.get("question_id")}
+                })
+                await resume_run(chat_id, {"type": "accept", "question_id": accept.get("question_id"), "finish": bool(accept.get("finish"))})
+            else:
+                await self._send_error(websocket, "Invalid resume payload: expected 'answer' or 'accept'")
+        except Exception as e:
+            logger.error(f"Error handling agent_resume: {e}")
+            await self._send_error(websocket, "Failed to resume agent")
     
     async def _handle_typing_start(
         self, 
@@ -312,6 +512,28 @@ class WebSocketManager:
         exclude_websocket: Optional[WebSocket] = None
     ):
         """Broadcast message to all connections in a chat."""
+        # Track pending interrupt lifecycle for auto-routing
+        try:
+            mtype = str(message.get("type"))
+            if mtype == "agent_interrupt_request":
+                data = message.get("data") or {}
+                if isinstance(data, dict) and data.get("question_id"):
+                    self.pending_interrupts[chat_id] = data
+                # While awaiting answer, the run is still considered in-flight
+                self.run_in_flight[chat_id] = True
+            elif mtype == "agent_interrupt_cleared":
+                self.pending_interrupts.pop(chat_id, None)
+            elif mtype == "stream_start":
+                self.run_in_flight[chat_id] = True
+            elif mtype == "ai_response_complete":
+                # Mark no in-flight run only if no pending interrupt
+                if chat_id not in self.pending_interrupts:
+                    self.run_in_flight[chat_id] = False
+            elif mtype == "error":
+                self.run_in_flight[chat_id] = False
+        except Exception:
+            pass
+
         if chat_id not in self.active_connections:
             return
         
@@ -323,7 +545,24 @@ class WebSocketManager:
     async def _send_to_websocket(self, websocket: WebSocket, message: dict):
         """Send message to a specific WebSocket."""
         try:
-            response = WebSocketMessageResponse(**message)
+            def _sanitize(obj):
+                if isinstance(obj, (str, int, float, bool)) or obj is None:
+                    return obj
+                if isinstance(obj, dict):
+                    return {str(k): _sanitize(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_sanitize(v) for v in obj]
+                # Fallback: stringify anything else (e.g., functions)
+                try:
+                    return str(obj)
+                except Exception:
+                    return "<non-serializable>"
+
+            safe_message = {
+                "type": str(message.get("type")),
+                "data": _sanitize(message.get("data", {})),
+            }
+            response = WebSocketMessageResponse(**safe_message)
             await websocket.send_text(response.model_dump_json())
         except WebSocketDisconnect:
             # Connection already closed, clean up

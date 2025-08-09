@@ -155,7 +155,9 @@ class WebSocketMessageRequest(BaseModel):
             "typing_stop",
             "join_chat",
             "leave_chat",
-            "ping"
+            "ping",
+            # HITL resume message (Phase 2 - will be handled when UI is ready)
+            "agent_resume",
         ]
         if v not in allowed_types:
             raise ValueError(f"WebSocket message type must be one of: {allowed_types}")
@@ -167,6 +169,19 @@ class WebSocketMessageResponse(BaseModel):
     type: str = Field(..., description="Response type")
     data: Dict[str, Any] = Field(..., description="Response data")
     timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+# Optional schemas for HITL WS payloads (Phase 2)
+class AgentInterruptRequest(BaseModel):
+    question_id: str
+    question: str
+    lens: Optional[str] = None
+    rationale: Optional[str] = None
+
+
+class AgentResumeRequest(BaseModel):
+    chat_id: str
+    answer: Dict[str, str]  # { question_id: str, text: str }
 
 
 class TypingIndicatorResponse(BaseModel):

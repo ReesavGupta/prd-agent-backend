@@ -98,7 +98,7 @@ class AIService:
             try:
                 self.models[AIProvider.GEMINI] = ChatGoogleGenerativeAI(
                     google_api_key=settings.GEMINI_API_KEY,
-                    model="gemini-2.5-flash",
+                    model=settings.GEMINI_MODEL,
                     temperature=settings.AI_TEMPERATURE,
                     max_output_tokens=settings.AI_MAX_TOKENS,
                     timeout=settings.AI_TIMEOUT_SECONDS
@@ -113,7 +113,7 @@ class AIService:
             try:
                 self.models[AIProvider.GROQ] = ChatGroq(
                     api_key=settings.GROQ_API_KEY,
-                    model="mixtral-8x7b-32768",
+                    model=settings.GROQ_MODEL,
                     temperature=settings.AI_TEMPERATURE,
                     max_tokens=settings.AI_MAX_TOKENS,
                     timeout=settings.AI_TIMEOUT_SECONDS
@@ -128,7 +128,7 @@ class AIService:
             try:
                 self.models[AIProvider.OPENAI] = ChatOpenAI(
                     api_key=settings.OPENAI_API_KEY,
-                    model="gpt-3.5-turbo",
+                    model=settings.OPENAI_MODEL,
                     temperature=settings.AI_TEMPERATURE,
                     max_completion_tokens=settings.AI_MAX_TOKENS,
                     timeout=settings.AI_TIMEOUT_SECONDS

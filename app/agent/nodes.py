@@ -1,0 +1,852 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.agent.state import AgentState
+import logging
+import re
+import json
+from app.services.ai_service import ai_service
+from functools import lru_cache
+from pathlib import Path
+import time
+from datetime import datetime
+try:
+    from langgraph.types import interrupt  # type: ignore
+except Exception:  # pragma: no cover - local dev fallback if langgraph not installed
+    def interrupt(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {"type": "accept"}
+
+
+def prepare_context(state: AgentState) -> AgentState:
+    """Trim and normalize inputs to keep within token/size budgets."""
+    # Keep at most 10 messages
+    state.last_messages = (state.last_messages or [])[-10:]
+
+    # Do not truncate PRD or Mermaid; send full artifacts downstream
+
+    # Limit attachments and prefer preview text
+    if state.attachments:
+        trimmed: List[Dict[str, Any]] = []
+        for att in state.attachments[:3]:
+            trimmed.append({
+                "name": att.get("name"),
+                "type": att.get("type"),
+                "text": att.get("text") or "",
+                "url": att.get("url") if not att.get("text") else None,
+            })
+        state.attachments = trimmed
+
+    return state
+
+
+@lru_cache(maxsize=1)
+def _load_prd_template_text() -> str:
+    """Load the canonical PRD template Markdown from backend/docs/PRD_template.md."""
+    try:
+        docs_path = Path(__file__).resolve().parents[2] / "docs" / "PRD_template.md"
+        return docs_path.read_text(encoding="utf-8")
+    except Exception as e:
+        # Fail-safe minimal template if file missing
+        return (
+            "# Product Requirement Document: {TITLE}\n\n"
+            "### 1. Product Overview / Purpose\n\n"
+            "### 2. Objective and Goals\n\n"
+            "### 3. User Personas\n\n"
+            "### 4. User Needs & Requirements\n\n"
+            "### 5. Features & Functional Requirements\n\n"
+            "### 6. Non-Functional Requirements\n\n"
+            "### 7. User Stories / UX Flow / Design Notes\n\n"
+            "### 8. Technical Specifications\n\n"
+            "### 9. Assumptions, Constraints & Dependencies\n\n"
+            "### 10. Timeline & Milestones\n\n"
+            "### 11. Success Metrics / KPIs\n\n"
+            "### 12. Release Criteria\n\n"
+            "### 13. Open Questions / Issues\n\n"
+            "### 14. Budget and Resources\n"
+        )
+
+
+def _normalize_section_name(name: str) -> str:
+    t = (name or "").strip().lower()
+    # collapse whitespace and punctuation variants
+    t = re.sub(r"\s+", " ", t)
+    t = t.replace("&", "and").replace("—", "-")
+    return t
+
+
+def _parse_sections_from_markdown(md: str) -> List[Tuple[str, int, int]]:
+    """Parse sections as (heading_text, start_idx, end_idx). Excludes top-level H1 title."""
+    lines = (md or "").splitlines()
+    sections: List[Tuple[str, int, int]] = []
+    current_head: Optional[str] = None
+    current_start: Optional[int] = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("###"):
+            # close previous
+            if current_head is not None and current_start is not None:
+                sections.append((current_head, current_start, i))
+            current_head = line.strip().lstrip("# ")
+            current_start = i + 1
+    if current_head is not None and current_start is not None:
+        sections.append((current_head, current_start, len(lines)))
+    return sections
+
+
+def _canonicalize_heading_key(text: str) -> str:
+    """Canonicalize a section heading to improve matching against template entries.
+
+    Rules:
+    - Strip leading '#' and whitespace
+    - Drop any inline description after ':'
+    - Collapse consecutive whitespace
+    - Replace '&' with 'and'; normalize dashes
+    - Lowercase result
+    Example:
+      "1.Product Overview / Purpose: Summary ..." -> "1. product overview / purpose"
+      "1. Product Overview / Purpose" -> "1. product overview / purpose"
+    """
+    if not text:
+        return ""
+    # Remove leading hashes/spaces
+    t = text.lstrip('# ').strip()
+    # Keep only part before ':' (inline description removed)
+    if ':' in t:
+        t = t.split(':', 1)[0]
+    # Normalize punctuation variants
+    t = t.replace('—', '-').replace('&', 'and')
+    # Ensure there is a space after a leading number like "1.Product" -> "1. Product"
+    t = re.sub(r'^(\d+)\.(\S)', r'\1. \2', t)
+    # Collapse whitespace
+    t = re.sub(r'\s+', ' ', t)
+    return t.strip().lower()
+
+
+def _compute_sections_status(prd_markdown: str, target_order: List[str]) -> Dict[str, bool]:
+    sections = _parse_sections_from_markdown(prd_markdown)
+    # Build map: normalized section key -> content length
+    content_by_key: Dict[str, int] = {}
+    lines = (prd_markdown or "").splitlines()
+    for head, s, e in sections:
+        # Remove the heading line content from body length
+        body = "\n".join(lines[s:e]).strip()
+        key = _canonicalize_heading_key(head)
+        content_by_key[key] = len(body)
+    result: Dict[str, bool] = {}
+    for sec in target_order:
+        key = _canonicalize_heading_key(sec)
+        length = content_by_key.get(key, 0)
+        # Consider a section complete if it has >= 60 non-whitespace chars
+        result[sec] = bool(length >= 60)
+    return result
+
+
+def _find_section_range(prd_markdown: str, target_section: str) -> Tuple[int, int, List[str], str]:
+    """Find the start/end (line indices) for the BODY of a target section.
+
+    Returns (start_idx, end_idx, lines, found_heading)
+    - start_idx/end_idx are indices into lines[] where body is located (exclusive of heading)
+    - If not found, returns (-1, -1, lines, "")
+    """
+    lines = (prd_markdown or "").splitlines()
+    target_key = _canonicalize_heading_key(target_section)
+    for head, s, e in _parse_sections_from_markdown(prd_markdown):
+        if _canonicalize_heading_key(head) == target_key:
+            return s, e, lines, head
+    return -1, -1, lines, ""
+
+
+def _sanitize_section_body(markdown_body: str) -> str:
+    """Normalize model output that should be ONLY the body of a section.
+
+    - Strip surrounding fences/backticks
+    - Remove any accidental headings
+    - Trim excessive blank lines
+    """
+    body = (markdown_body or "").strip()
+    if body.startswith("```"):
+        body = body.strip("`\n ")
+        # common case of ```markdown
+        if body.lower().startswith("markdown"):
+            body = body[len("markdown"):].lstrip()
+    # Drop any leading markdown headings accidentally emitted
+    cleaned_lines: List[str] = []
+    for raw in body.splitlines():
+        line = raw.rstrip()
+        if line.lstrip().startswith("### ") or line.lstrip().startswith("## ") or line.lstrip().startswith("# "):
+            continue
+        cleaned_lines.append(line)
+    # Collapse excessive blank lines
+    out: List[str] = []
+    prev_blank = False
+    for line in cleaned_lines:
+        is_blank = (line.strip() == "")
+        if is_blank and prev_blank:
+            continue
+        out.append(line)
+        prev_blank = is_blank
+    return "\n".join(out).strip()
+
+
+def _replace_section_body(prd_markdown: str, target_section: str, new_body: str) -> str:
+    """Replace ONLY the body of the target section, preserving all other text.
+
+    If the section is not found, append it to the end using the exact template heading.
+    """
+    start, end, lines, found_heading = _find_section_range(prd_markdown, target_section)
+    body = _sanitize_section_body(new_body)
+    if start == -1:
+        # Append new section at the end
+        block = [f"### {target_section}", "", body, ""]
+        out = ("\n".join(lines) + ("\n" if not prd_markdown.endswith("\n") else "")) + "\n".join(block)
+        return out
+    # Replace content between start and end with sanitized body
+    before = lines[:start]
+    after = lines[end:]
+    new_block: List[str] = [body, ""] if body else [""]
+    updated = before + new_block + after
+    # Preserve final newline if original had it
+    result = "\n".join(updated)
+    if prd_markdown.endswith("\n") and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _system_prompt_initial_outline(template_text: str, title: str) -> str:
+    """Prompt the model to output ONLY the outline based on the canonical template."""
+    return (
+        "You are a product manager generating an initial PRD outline.\n"
+        "Rules:\n"
+        "- Begin with exactly one H1 line: '# Product Requirement Document: "
+        + title.replace("\n", " ").strip()
+        + "'\n"
+        "- Then output the sections exactly as in the template below.\n"
+        "- Do NOT add any commentary before or after.\n"
+        "- Do NOT include code fences.\n\n"
+        "Template (copy sections and headings verbatim; it's okay if bodies are empty initially):\n\n"
+        + template_text
+    )
+
+
+def _system_prompt_refine() -> str:
+    return (
+        "You will update only ONE section of the PRD based on the user's answer.\n"
+        "- Preserve the existing structure and all headings exactly.\n"
+        "- Replace ONLY the body of the target section with detailed, concrete content.\n"
+        "- Output the FULL updated PRD Markdown.\n"
+        "- Do NOT add any extra commentary."
+    )
+
+
+async def generate_prd(state: AgentState) -> AgentState:
+    """Generate PRD OUTLINE ONLY and stream preface (if any) to chat, PRD to editor."""
+    from app.websocket.publisher import publish_to_chat
+
+    async def _emit(event: Dict[str, Any]) -> None:
+        if callable(state.send_event):
+            await state.send_event(event)  # type: ignore
+        elif state.ws_chat_id:
+            await publish_to_chat(state.ws_chat_id, event)
+
+    await _emit({"type": "stream_start", "data": {"project_id": state.project_id}})
+
+    # Build outline-only prompt
+    template_text = _load_prd_template_text()
+    derived_title = (state.idea or "Untitled").strip()[:120]
+    system_msg = {
+        "role": "system",
+        "content": _system_prompt_initial_outline(template_text, derived_title),
+    }
+    user_msg = {"role": "user", "content": f"Idea: {state.idea or ''}"}
+    messages = [system_msg, user_msg]
+
+    prd_accum = ""
+    seen_prd_heading = False
+    last_provider: str | None = None
+    last_model: str | None = None
+    import time
+    start_time = time.time()
+    # Simple pacing for artifacts_preview
+    last_emit_len = 0
+    async for chunk in ai_service.generate_stream(
+        user_id=state.user_id,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=1200,
+    ):
+        if chunk.is_complete:
+            # Close any open chat stream
+            await _emit({
+                "type": "ai_response_streaming",
+                "data": {"delta": "", "is_complete": True, "provider": chunk.provider, "model": chunk.model},
+            })
+            break
+        delta = chunk.content
+        last_provider = chunk.provider
+        last_model = chunk.model
+        if not seen_prd_heading:
+            # Detect the PRD heading boundary
+            if "# Product Requirement Document:" in (prd_accum + delta):
+                seen_prd_heading = True
+                # Compute from first heading occurrence
+                combined = prd_accum + delta
+                idx = combined.find("# Product Requirement Document:")
+                prd_accum = combined[idx:]
+                # Stop chat streaming from now on; start editor updates immediately
+                await _emit({
+                    "type": "artifacts_preview",
+                    "data": {"prd_markdown": prd_accum, "mermaid": None},
+                })
+                last_emit_len = len(prd_accum)
+            else:
+                # Forward preface delta to chat
+                await _emit({
+                    "type": "ai_response_streaming",
+                    "data": {"delta": delta, "is_complete": False, "provider": chunk.provider, "model": chunk.model},
+                })
+                prd_accum += delta
+        else:
+            prd_accum += delta
+            # Throttle: emit only if significant growth
+            if len(prd_accum) - last_emit_len >= 80:
+                await _emit({
+                    "type": "artifacts_preview",
+                    "data": {"prd_markdown": prd_accum, "mermaid": None},
+                })
+                last_emit_len = len(prd_accum)
+
+    # Finalize
+    state.prd_markdown = prd_accum
+    # Emit final artifacts + sections status
+    sections_order = state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []
+    sec_status = _compute_sections_status(state.prd_markdown, sections_order)
+    state.sections_status = sec_status
+    await _emit({
+        "type": "artifacts_preview",
+        "data": {
+            "prd_markdown": state.prd_markdown,
+            "mermaid": None,
+            "sections_status": sec_status,
+        },
+    })
+    # Mark end of this streaming segment so UI can re-enable input promptly
+    await _emit({
+        "type": "ai_response_complete",
+        "data": {"message": "Outline generated"},
+    })
+    try:
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        state.telemetry = {
+            "provider": last_provider,
+            "model": last_model,
+            "response_time_ms": elapsed_ms,
+        }
+    except Exception:
+        pass
+    return state
+
+
+async def generate_mermaid(state: AgentState) -> AgentState:
+    """Generate Mermaid code (non-stream for simplicity)."""
+    from app.websocket.publisher import publish_to_chat
+
+    async def _emit(event: Dict[str, Any]) -> None:
+        if callable(state.send_event):
+            await state.send_event(event)  # type: ignore
+        elif state.ws_chat_id:
+            await publish_to_chat(state.ws_chat_id, event)
+    logger = logging.getLogger(__name__)
+
+    system_msg = {
+        "role": "system",
+        "content": "Generate a Mermaid system architecture diagram that aligns with the PRD. Output RAW Mermaid only.",
+    }
+    user_msg = {"role": "user", "content": f"PRD markdown:\n{state.prd_markdown}"}
+
+    logger.info("[mermaid] generating diagram: prd_len=%s user_id=%s", len(state.prd_markdown or ""), state.user_id)
+    response = await ai_service.generate_response(
+        user_id=state.user_id,
+        messages=[system_msg, user_msg],
+        temperature=0.2,
+        max_tokens=1200,
+    )
+
+    raw = response.content or ""
+    logger.info("[mermaid] raw_len=%s prefix=%r", len(raw), raw[:60])
+    mermaid = raw.strip()
+    if mermaid.startswith("```"):
+        mermaid = mermaid.strip("`\n ")
+        if mermaid.startswith("mermaid"):
+            mermaid = mermaid[len("mermaid"):].lstrip()
+    logger.info("[mermaid] normalized_len=%s prefix=%r", len(mermaid), mermaid[:60])
+
+    def looks_like_mermaid(text: str) -> bool:
+        if not text:
+            return False
+        head = text.strip().lower()
+        if head.startswith("graph ") or head.startswith("flowchart "):
+            return True
+        # other valid diagram types
+        for kw in ("sequencediagram", "classdiagram", "gantt", "stateDiagram-v2", "erDiagram", "journey", "pie", "mindmap"):
+            if head.startswith(kw.lower()):
+                return True
+        return False
+
+    def looks_like_c4(text: str) -> bool:
+        c4_markers = ("c4context", "c4container", "c4component", "person(", "container(", "system_boundary", "rel(")
+        t = text.strip().lower()
+        return any(m in t for m in c4_markers)
+
+    # Retry strategy if empty or not valid mermaid (e.g., C4 DSL)
+    if not mermaid or not looks_like_mermaid(mermaid) or looks_like_c4(mermaid):
+      if looks_like_c4(mermaid):
+          logger.warning("[mermaid] detected C4/Structurizr-like output; retrying for raw Mermaid flowchart")
+      logger.warning("[mermaid] empty output on first attempt; retrying with stricter prompt and no cache")
+      retry_system = {
+          "role": "system",
+          "content": (
+              "You are a helpful systems architect. Output ONLY raw Mermaid flowchart code. "
+              "Start with 'graph TD' (or 'graph LR'). Do NOT use C4, PlantUML, Structurizr DSL, titles, or backticks. "
+              "No prose. Only the diagram."
+          ),
+      }
+      retry_user = {
+          "role": "user",
+          "content": (
+              "Derive an architecture from this PRD. If uncertain, output a generic but valid diagram: "
+              "graph TD; U[User]-->F[Frontend]; F-->B[Backend]; B-->D[Database]" \
+              f"\n\nPRD:\n{state.prd_markdown[:12000]}"
+          ),
+      }
+      try:
+        retry_resp = await ai_service.generate_response(
+            user_id=state.user_id,
+            messages=[retry_system, retry_user],
+            temperature=0.1,
+            max_tokens=1200,
+            use_cache=False,
+        )
+        raw2 = retry_resp.content or ""
+        logger.info("[mermaid] retry raw_len=%s prefix=%r", len(raw2), raw2[:60])
+        m2 = raw2.strip()
+        if m2.startswith("```"):
+            m2 = m2.strip("`\n ")
+            if m2.startswith("mermaid"):
+                m2 = m2[len("mermaid"):].lstrip()
+        logger.info("[mermaid] retry normalized_len=%s prefix=%r", len(m2), m2[:60])
+        mermaid = m2
+      except Exception as e:
+        logger.error("[mermaid] retry failed: %s", e)
+
+    # Final fallback: ensure we don't overwrite with empty
+    if mermaid and looks_like_mermaid(mermaid) and not looks_like_c4(mermaid):
+        state.mermaid = mermaid
+    else:
+        logger.warning("[mermaid] still empty after retry; using minimal default")
+        state.mermaid = "graph TD; U[User]-->F[Frontend]; F-->B[Backend]; B-->D[(Database)]"
+
+    await _emit({
+        "type": "artifacts_preview",
+        "data": {
+            "prd_markdown": state.prd_markdown,
+            "mermaid": state.mermaid,
+            "thinking_lens_status": state.coverage_status or {
+                "discovery": True,
+                "user_journey": True,
+                "metrics": True,
+                "gtm": True,
+                "risks": True,
+            },
+            "sections_status": state.sections_status or {},
+        },
+    })
+    return state
+
+
+async def postprocess(state: AgentState) -> AgentState:
+    from app.websocket.publisher import publish_to_chat
+
+    async def _emit(event: Dict[str, Any]) -> None:
+        if callable(state.send_event):
+            await state.send_event(event)  # type: ignore
+        elif state.ws_chat_id:
+            await publish_to_chat(state.ws_chat_id, event)
+    # Best-effort enrichment from telemetry if present
+    provider = state.telemetry.get("provider") if isinstance(state.telemetry, dict) else None
+    model = state.telemetry.get("model") if isinstance(state.telemetry, dict) else None
+    response_time_ms = state.telemetry.get("response_time_ms") if isinstance(state.telemetry, dict) else None
+
+    await _emit({
+        "type": "ai_response_complete",
+        "data": {
+            "message": "Artifacts generated",
+            "project_id": state.project_id,
+            "provider": provider,
+            "model": model,
+            "response_time_ms": response_time_ms,
+        },
+    })
+    return state
+
+
+# ----------------------
+# HITL loop nodes (Phase 2)
+# ----------------------
+
+def analyze_gaps(state: AgentState) -> AgentState:
+    """Compute template-section completeness and determine whether to finish or continue."""
+    full_text = state.prd_markdown or ""
+    sections_order: List[str] = state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []
+    max_q = int(state.completion_targets.get("max_questions", 14)) if isinstance(state.completion_targets, dict) else 14
+
+    sec_status = _compute_sections_status(full_text, sections_order)
+    state.sections_status = sec_status
+    sections_ok = all(sec_status.values()) if sec_status else False
+
+    forced_finish = bool((state.telemetry or {}).get("force_finish"))
+    min_q = int(state.completion_targets.get("min_questions_before_finish", 0)) if isinstance(state.completion_targets, dict) else 0
+    have_min = state.iteration_index >= max(min_q, 0)
+    hit_limit = state.iteration_index >= max_q
+    # Require at least min_q Q/A incorporations unless explicitly forced to finish
+    should_finish = forced_finish or (sections_ok and have_min) or hit_limit
+
+    state.telemetry = {**(state.telemetry or {}), "sections_ok": sections_ok, "should_finish": should_finish}
+    return state
+
+
+async def propose_next_question(state: AgentState) -> AgentState:
+    """Select the earliest incomplete PRD section and ask a guided question with required phrasing."""
+    if (state.telemetry or {}).get("should_finish"):
+        state.pending_question = None
+        return state
+
+    order: List[str] = state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []
+    status = state.sections_status or {}
+    target: Optional[str] = None
+    for sec in order:
+        if not bool(status.get(sec)):
+            target = sec
+            break
+    if not target:
+        state.pending_question = None
+        return state
+
+    # Deterministic question templates per section
+    qmap: Dict[str, str] = {
+        "1. Product Overview / Purpose": "what is the core product and primary value proposition, and who is it primarily for?",
+        "2. Objective and Goals": "what are the 2–3 concrete goals for the first release, and how will we know we've succeeded?",
+        "3. User Personas": "which user personas will use this and what defining traits or roles do they have?",
+        "4. User Needs & Requirements": "what specific user problems or needs must be addressed in v1?",
+        "5. Features & Functional Requirements": "which 5–8 core features must be included, with a brief description each?",
+        "6. Non-Functional Requirements": "what performance, reliability, and security expectations should we set?",
+        "7. User Stories / UX Flow / Design Notes": "what is the happy-path user flow from entry to success, step-by-step?",
+        "8. Technical Specifications": "what is the preferred tech stack or key integrations we should plan for?",
+        "9. Assumptions, Constraints & Dependencies": "are there known constraints, dependencies, or assumptions we must work within?",
+        "10. Timeline & Milestones": "what is the desired timeline and high-level milestones?",
+        "11. Success Metrics / KPIs": "what primary success metrics and guardrails should we track?",
+        "12. Release Criteria": "what functionality, performance, and reliability criteria are required for launch?",
+        "13. Open Questions / Issues": "what outstanding decisions or risks should we call out now?",
+        "14. Budget and Resources": "what budget or resource constraints should we assume?",
+    }
+    base = qmap.get(target, f"what details do you want to include in the {target} section?")
+    # Keep the question crisp and direct
+    phrased = f"{target}: {base}"
+    state.pending_question = {
+        "id": f"sec_{order.index(target)+1}",
+        "question": phrased,
+        "section": target,
+        "rationale": f"Fill out the '{target}' section with concrete details.",
+    }
+    return state
+
+
+async def await_human_answer(state: AgentState) -> AgentState:
+    """Pause the graph and request human input using LangGraph interrupt()."""
+    if not state.pending_question:
+        return state
+    payload = {
+        "type": "question",
+        "question": state.pending_question.get("question"),
+        "section": state.pending_question.get("section"),
+        "question_id": state.pending_question.get("id"),
+        "rationale": state.pending_question.get("rationale"),
+    }
+    # Notify client over WebSocket before pausing execution
+    try:
+        if callable(state.send_event):
+            await state.send_event({  # type: ignore
+                "type": "agent_interrupt_request",
+                "data": payload,
+            })
+        else:
+            from app.websocket.publisher import publish_to_chat
+            if state.ws_chat_id:
+                await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_request", "data": payload})
+        # Also emit the assistant question as a chat message exactly once, with stable id
+        try:
+            qid = str(state.pending_question.get("id") or "")
+            qtext = str(state.pending_question.get("question") or "").strip()
+            if qid and qtext and state.ws_chat_id:
+                from app.websocket.publisher import publish_to_chat
+                await publish_to_chat(state.ws_chat_id, {
+                    "type": "message_sent",
+                    "data": {
+                        "message_id": f"q:{qid}",
+                        "user_id": state.user_id,
+                        "content": qtext,
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "message_type": "assistant",
+                    },
+                })
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Track asked question for de-duplication before interrupting
+    try:
+        qtext = state.pending_question.get("question", "") if state.pending_question else ""
+        if qtext:
+            if not isinstance(state.asked_questions, list):
+                state.asked_questions = []
+            state.asked_questions.append(qtext)
+    except Exception:
+        pass
+
+    response = interrupt(payload)
+    # Expected resume shapes:
+    # - {"type": "answer", "question_id": str, "text": str}
+    # - {"type": "accept", "finish"?: bool} (skip/finish)
+    state.telemetry = {**(state.telemetry or {}), "last_interrupt": payload}
+    if isinstance(response, dict) and response.get("type") == "answer":
+        state.answered_qa.append({
+            "question": state.pending_question.get("question", ""),
+            "answer": response.get("text", ""),
+            "section": state.pending_question.get("section"),
+        })
+    elif isinstance(response, dict) and response.get("type") == "accept":
+        # Mark finish on request
+        if response.get("finish"):
+            state.telemetry = {**(state.telemetry or {}), "force_finish": True}
+    # Clear pending question regardless; next node decides what to do
+    state.pending_question = None
+    return state
+
+
+async def incorporate_answer(state: AgentState) -> AgentState:
+    """Regenerate/expand PRD for the targeted section given latest answer; emit preview."""
+    if not state.answered_qa:
+        return state
+    # Emit helper (streams via callback if present, else broadcast to chat)
+    from app.websocket.publisher import publish_to_chat
+
+    async def _emit(event: Dict[str, Any]) -> None:
+        if callable(state.send_event):
+            await state.send_event(event)  # type: ignore
+        elif getattr(state, "ws_chat_id", None):
+            await publish_to_chat(state.ws_chat_id, event)  # type: ignore
+
+    send = state.send_event or (lambda *_args, **_kwargs: None)
+    # Build messages to refine PRD using newest Q/A with retry
+    latest_one = state.answered_qa[-1]
+    target_section = latest_one.get("section") or ""
+    system_msg = {
+        "role": "system",
+        "content": (
+            "You will update only ONE section of the PRD based on the user's answer.\n"
+            "- Preserve the existing structure and all headings exactly.\n"
+            "- Replace ONLY the body of the target section with detailed, concrete content.\n"
+            "- Output the FULL updated PRD Markdown.\n"
+            "- Do NOT add any extra commentary."
+        ),
+    }
+    user_msg = {
+        "role": "user",
+        "content": (
+            f"Current PRD (full):\n{state.prd_markdown}\n\n"
+            f"Target section: {target_section}\n"
+            f"Answer: {latest_one.get('answer','')}\n"
+        ),
+    }
+    # 1) Update PRD deterministically: ask model for BODY ONLY, then splice into PRD
+    # Prepare existing body to give the model focused context
+    try:
+        s_idx, e_idx, lines, _head = _find_section_range(state.prd_markdown, target_section)
+        existing_body = "\n".join(lines[s_idx:e_idx]).strip() if s_idx != -1 else ""
+    except Exception:
+        existing_body = ""
+
+    style_hints: Dict[str, str] = {
+        "1. Product Overview / Purpose": "Write 1–2 short paragraphs (<= 120 words total). State product, primary value, and primary audience.",
+        "2. Objective and Goals": "Write 2–4 bullet points. Each goal must be concrete and measurable (include a target and timeframe where possible).",
+        "3. User Personas": "Write 1–2 concise personas with bullets: key traits, goals, pain points, context. Use respectful, neutral language.",
+        "4. User Needs & Requirements": "Write 5–8 bullet points of user needs/problems (not solutions). Keep each bullet crisp.",
+        "5. Features & Functional Requirements": "Write 5–8 bullets, each naming a feature and its outcome. Keep neutral, no fluff.",
+        "6. Non-Functional Requirements": "Write bullets for performance, reliability, security, privacy, accessibility. Add sensible targets where possible.",
+        "7. User Stories / UX Flow / Design Notes": "Write a short happy-path flow as numbered steps (5–8) and any key design notes.",
+        "8. Technical Specifications": "List stack/integrations/constraints as bullets. Keep practical and specific.",
+        "9. Assumptions, Constraints & Dependencies": "List assumptions and constraints as bullets. Mention external dependencies.",
+        "10. Timeline & Milestones": "Write 3–5 milestones with rough timing (e.g., Week 2, Week 6, Launch).",
+        "11. Success Metrics / KPIs": "List 3–5 primary metrics plus any guardrails.",
+        "12. Release Criteria": "Bullet list of must-pass checks for launch: functionality, performance, reliability, support.",
+        "13. Open Questions / Issues": "List 3–7 decisions/risks to resolve.",
+        "14. Budget and Resources": "Brief bullets for team roles and budget bands if known.",
+    }
+
+    refine_system = {
+        "role": "system",
+        "content": (
+            "You update PRDs. Output ONLY the Markdown BODY for the specified section. "
+            "NO headings, NO backticks, NO preface/postface. "
+            "Do not copy the user's words verbatim; rewrite professionally and concretely. "
+            "Keep it concise."
+        ),
+    }
+    refine_user = {
+        "role": "user",
+        "content": (
+            f"Section: {target_section}\n"
+            f"Style rules: {style_hints.get(target_section, 'Keep it concise and structured with short paragraphs or bullets.')}\n\n"
+            f"Existing body (may be empty):\n{existing_body}\n\n"
+            f"User answer (source to interpret/rewrite, not to copy):\n{latest_one.get('answer','')}\n"
+        ),
+    }
+
+    try:
+        # First attempt: concise rewrite
+        resp = await ai_service.generate_response(
+            user_id=state.user_id,
+            messages=[refine_system, refine_user],
+            temperature=0.3,
+            max_tokens=900,
+            use_cache=False,
+        )
+        section_body = _sanitize_section_body(resp.content)
+
+        # If under-sized, try one expansion pass before fallback
+        try:
+            body_text = section_body.strip() if section_body else ""
+            needs_expand = False
+            if target_section.startswith('1.') and len(body_text) < 180:
+                needs_expand = True
+            if target_section.startswith('2.'):
+                bullets = [ln for ln in body_text.splitlines() if ln.strip().startswith(('-', '*'))]
+                if len(bullets) < 3:
+                    needs_expand = True
+            if not body_text:
+                needs_expand = True
+            if needs_expand:
+                expand_system = {
+                    "role": "system",
+                    "content": (
+                        "Expand the section BODY with concrete, useful detail. Maintain concision and structure. "
+                        "No headings, no backticks."
+                    ),
+                }
+                expand_user = {
+                    "role": "user",
+                    "content": (
+                        f"Section: {target_section}\n"
+                        f"Style rules: {style_hints.get(target_section, '')}\n\n"
+                        f"Draft body to improve:\n{body_text or existing_body}\n"
+                    ),
+                }
+                resp2 = await ai_service.generate_response(
+                    user_id=state.user_id,
+                    messages=[expand_system, expand_user],
+                    temperature=0.3,
+                    max_tokens=900,
+                    use_cache=False,
+                )
+                improved = _sanitize_section_body(resp2.content)
+                if improved and len(improved.strip()) > len(body_text):
+                    section_body = improved
+        except Exception:
+            pass
+
+        # If the model still under-delivered, synthesize a minimal useful body
+        if not section_body or len(section_body.strip()) < 60:
+            # Deterministic guardrails per section
+            ans = (latest_one.get('answer','') or '').strip()
+            if target_section.startswith('2.'):
+                # Objectives: ensure at least 3 measurable bullets
+                fallback = [
+                    "- Deliver a polished, responsive UI rated ≥ 4.5/5 in usability testing (N ≥ 10).",
+                    "- Achieve time-to-interactive ≤ 2s on mid‑range devices for core flows.",
+                    "- Reach CSAT ≥ 4.2/5 across the first 50 user sessions.",
+                ]
+                # If the answer mentions UI/feel, bias bullets toward UX
+                if ans:
+                    lower = ans.lower()
+                    if 'ui' in lower or 'feel' in lower or 'design' in lower:
+                        fallback[0] = "- Ship a clean, accessible UI (WCAG AA) with ≥ 4.5/5 SUS score (N ≥ 10)."
+                section_body = "\n".join(fallback)
+            elif target_section.startswith('1.'):
+                section_body = (
+                    "This product serves its primary audience with a clear value proposition and focused problem–solution fit. "
+                    "It explains what the product is, who it is for, and why it matters, in practical terms that guide scope and priorities."
+                )
+            else:
+                # Generic fallback
+                section_body = ans[:300] if ans else "(to be detailed)"
+        state.prd_markdown = _replace_section_body(state.prd_markdown, target_section, section_body)
+    except Exception:
+        # On error, leave PRD unchanged
+        pass
+    # Recompute section status
+    order = state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []
+    state.sections_status = _compute_sections_status(state.prd_markdown, order)
+    await _emit({
+        "type": "artifacts_preview",
+        "data": {
+            "prd_markdown": state.prd_markdown,
+            "mermaid": None,
+            "sections_status": state.sections_status or {},
+        },
+    })
+    # 3) Briefly acknowledge AFTER updating PRD
+    try:
+        await _emit({"type": "stream_start", "data": {"project_id": state.project_id}})
+        ack_system = {
+            "role": "system",
+            "content": (
+                "You are a concise product partner. Acknowledge in 1 short sentence and note the section updated. "
+                "Do NOT ask a new question."
+            ),
+        }
+        ack_user = {
+            "role": "user",
+            "content": (
+                f"Question: {latest_one.get('question','')}\n"
+                f"Answer: {latest_one.get('answer','')}\n"
+                f"Section: {target_section}"
+            ),
+        }
+        last_provider: str | None = None
+        last_model: str | None = None
+        async for chunk in ai_service.generate_stream(
+            user_id=state.user_id,
+            messages=[ack_system, ack_user],
+            temperature=0.2,
+            max_tokens=80,
+        ):
+            if chunk.is_complete:
+                await _emit({
+                    "type": "ai_response_streaming",
+                    "data": {"delta": "", "is_complete": True, "provider": chunk.provider, "model": chunk.model},
+                })
+            else:
+                last_provider = chunk.provider
+                last_model = chunk.model
+                await _emit({
+                    "type": "ai_response_streaming",
+                    "data": {"delta": chunk.content, "is_complete": False, "provider": chunk.provider, "model": chunk.model},
+                })
+        await _emit({
+            "type": "ai_response_complete",
+            "data": {"message": "Acknowledged user answer", "provider": last_provider, "model": last_model},
+        })
+    except Exception:
+        pass
+    state.iteration_index += 1
+    return state
+

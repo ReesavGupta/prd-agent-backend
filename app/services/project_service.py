@@ -29,7 +29,10 @@ class ProjectService:
         self,
         user_id: str,
         project_request: ProjectCreateRequest,
-        files: Optional[List[UploadFile]] = None
+        files: Optional[List[UploadFile]] = None,
+        *,
+        created_from_chat: bool = False,
+        source_chat_id: Optional[str] = None,
     ) -> ProjectResponse:
         """Create a new project with optional file uploads."""
         try:
@@ -45,7 +48,9 @@ class ProjectService:
                 "user_id": user_id,
                 "project_name": project_name,
                 "initial_idea": project_request.initial_idea,
-                "created_from_chat": False
+                "created_from_chat": created_from_chat,
+                # note: repository will persist as provided; keep source_chat_id optional
+                "source_chat_id": source_chat_id,
             }
 
             # Create project
