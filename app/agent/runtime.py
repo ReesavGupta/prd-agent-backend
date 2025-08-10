@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from app.agent.state import AgentState
-from app.agent.graph import compile_graph
+from app.agent.graph import compile_graph, compile_flowchart_graph
 from langgraph.types import Command
 
 
@@ -28,4 +28,16 @@ async def resume_run(thread_id: str, resume_payload: Dict[str, Any]) -> None:
     graph = compile_graph()
     config = {"configurable": {"thread_id": thread_id}}
     await graph.ainvoke(Command(resume=resume_payload), config=config)
+
+
+async def start_flowchart_run(state: AgentState, thread_id: str) -> Dict[str, Any]:
+    """Start a flowchart-only run bound to a separate thread id (e.g., fc:{chat_id}).
+
+    This does not generate or modify the PRD. It only invokes the minimal flowchart graph
+    that generates Mermaid and emits standard events.
+    """
+    graph = compile_flowchart_graph()
+    config = {"configurable": {"thread_id": thread_id}}
+    await graph.ainvoke(state, config=config)
+    return {"prd_markdown": state.prd_markdown, "mermaid": state.mermaid}
 

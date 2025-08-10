@@ -450,7 +450,13 @@ async def generate_prd(state: AgentState) -> AgentState:
 
 
 async def generate_mermaid(state: AgentState) -> AgentState:
-    """Generate Mermaid code (non-stream for simplicity)."""
+    """Generate Mermaid code (non-stream for simplicity).
+
+    Supports two entry modes:
+    - PRD-run path: invoked after PRD work; uses state.prd_markdown
+    - Flowchart-only path: invoked via flowchart agent; uses state.base_prd_markdown/state.prd_markdown
+      and may include state.base_mermaid as a prior diagram to update.
+    """
     from app.websocket.publisher import publish_to_chat
 
     async def _emit(event: Dict[str, Any]) -> None:
@@ -460,21 +466,93 @@ async def generate_mermaid(state: AgentState) -> AgentState:
             await publish_to_chat(state.ws_chat_id, event)
     logger = logging.getLogger(__name__)
 
-    system_msg = {
-        "role": "system",
-        "content": "Generate a Mermaid system architecture diagram that aligns with the PRD. Output RAW Mermaid only.",
-    }
-    user_msg = {"role": "user", "content": f"PRD markdown:\n{state.prd_markdown}"}
-
-    logger.info("[mermaid] generating diagram: prd_len=%s user_id=%s", len(state.prd_markdown or ""), state.user_id)
-    response = await ai_service.generate_response(
-        user_id=state.user_id,
-        messages=[system_msg, user_msg],
-        temperature=0.2,
-        max_tokens=1200,
+    owner_prompt = (
+        "You are an experienced Product Manager and Technical Writer skilled at translating Product "
+        "Requirements Documents (PRDs) into clear, accurate, and professional Mermaid flowcharts. "
+        "Your goal is to take a PRD.md file and produce a valid Mermaid `flowchart TD` diagram that faithfully "
+        "represents the process, systems, and interactions described.\n\n"
+        "Follow these rules and guidelines:\n\n"
+        "1. Purpose – read the PRD, identify actors/systems/agents/processes/states/data flows; produce a clear top-down diagram.\n"
+        "2. Structure – use Mermaid `flowchart TD`; group nodes with subgraphs; include user actions, system processes, and data persistence nodes; include loops/branches if described; reflect happy path and key secondary flows.\n"
+        "3. Filling Gaps – make minimal, obvious assumptions only to maintain continuity (e.g., input validation).\n"
+        "4. Accuracy – reflect actual structure/order; use PRD terminology; keep component names consistent with the PRD.\n"
+        "5. Readability – concise node names; directional arrows; use labeled edges where helpful; split into subgraphs for clarity.\n"
+        "6. Output Requirements – ONLY output Mermaid code enclosed in triple backticks as ```mermaid ... ```; ensure valid syntax that renders.\n"
+        "7. Tone – choose clarity over complexity; resolve minor ambiguities pragmatically."
     )
 
-    raw = response.content or ""
+    prior_mermaid = (state.base_mermaid or "").strip()
+    prd_text = state.prd_markdown or state.base_prd_markdown or ""
+
+    system_msg = {"role": "system", "content": owner_prompt}
+    if prior_mermaid:
+        user_content = (
+            "PRD markdown (full):\n" + prd_text + "\n\n"
+            "Previous Mermaid (update/refine to match the PRD; preserve structure/IDs where sensible):\n"
+            + prior_mermaid
+        )
+    else:
+        user_content = "PRD markdown (full):\n" + prd_text
+    user_msg = {"role": "user", "content": user_content}
+
+    logger.info("[mermaid] generating diagram: prd_len=%s user_id=%s", len(state.prd_markdown or ""), state.user_id)
+    # Helper: try to generate mermaid given a PRD text
+    async def _gen_from_prd(prd: str) -> str:
+        sm = {"role": "system", "content": owner_prompt}
+        um = {"role": "user", "content": user_content.replace(prd_text, prd, 1)}
+        resp = await ai_service.generate_response(
+            user_id=state.user_id,
+            messages=[sm, um],
+            temperature=0.2,
+            max_tokens=1200,
+            use_cache=False,
+        )
+        return (resp.content or "").strip()
+
+    # Try direct generation; on provider error (e.g., length), summarize PRD and retry once
+    try:
+        response = await ai_service.generate_response(
+            user_id=state.user_id,
+            messages=[system_msg, user_msg],
+            temperature=0.2,
+            max_tokens=1200,
+            use_cache=False,
+        )
+        raw = response.content or ""
+        summarized_used = False
+    except Exception as e:
+        # Summarization fallback (Phase 3): reduce PRD, then regenerate
+        logger.warning("[mermaid] initial generation failed, attempting summarization fallback: %s", e)
+        try:
+            sum_system = {
+                "role": "system",
+                "content": (
+                    "Summarize the following PRD into concise plain text focusing on key actors, "
+                    "systems, interactions, and flows. Keep structure/order. No code fences, no markdown, <= 1200 tokens."
+                ),
+            }
+            sum_user = {"role": "user", "content": prd_text[:24000]}
+            sum_resp = await ai_service.generate_response(
+                user_id=state.user_id,
+                messages=[sum_system, sum_user],
+                temperature=0.0,
+                max_tokens=1000,
+                use_cache=False,
+            )
+            summarized = (sum_resp.content or prd_text).strip()
+            raw = await _gen_from_prd(summarized)
+            summarized_used = True
+            try:
+                # annotate telemetry for postprocess message
+                state.telemetry = {**(state.telemetry or {}), "flowchart_note": "Flowchart derived from summarized PRD due to size"}
+            except Exception:
+                pass
+        except Exception as ee:
+            logger.error("[mermaid] summarization fallback failed: %s", ee)
+            raw = ""
+            summarized_used = False
+
+    # Continue with normalization pipeline on 'raw'
     logger.info("[mermaid] raw_len=%s prefix=%r", len(raw), raw[:60])
     mermaid = raw.strip()
     if mermaid.startswith("```"):
@@ -516,9 +594,9 @@ async def generate_mermaid(state: AgentState) -> AgentState:
       retry_user = {
           "role": "user",
           "content": (
-              "Derive an architecture from this PRD. If uncertain, output a generic but valid diagram: "
-              "graph TD; U[User]-->F[Frontend]; F-->B[Backend]; B-->D[Database]" \
-              f"\n\nPRD:\n{state.prd_markdown[:12000]}"
+              "Derive a Mermaid flowchart from this PRD. Use 'flowchart TD' and no backticks. "
+              "Do not use C4/PlantUML/Structurizr. Reflect the PRD accurately.\n\n" 
+              f"PRD:\n{prd_text[:12000]}" + (f"\n\nPrevious Mermaid (optional):\n{prior_mermaid}" if prior_mermaid else "")
           ),
       }
       try:
@@ -541,12 +619,12 @@ async def generate_mermaid(state: AgentState) -> AgentState:
       except Exception as e:
         logger.error("[mermaid] retry failed: %s", e)
 
-    # Final fallback: ensure we don't overwrite with empty
+    # Final fallback: ensure we don't overwrite with empty; add minimal but valid default
     if mermaid and looks_like_mermaid(mermaid) and not looks_like_c4(mermaid):
         state.mermaid = mermaid
     else:
-        logger.warning("[mermaid] still empty after retry; using minimal default")
-        state.mermaid = "graph TD; U[User]-->F[Frontend]; F-->B[Backend]; B-->D[(Database)]"
+        logger.warning("[mermaid] still empty/invalid after retry; using minimal default")
+        state.mermaid = "flowchart TD; U[User]-->F[Frontend]; F-->B[Backend]; B-->D[(Database)]"
 
     await _emit({
         "type": "artifacts_preview",

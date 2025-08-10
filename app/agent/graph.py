@@ -99,3 +99,21 @@ def compile_graph() -> StateGraph:
     # Phase 1: compile with in-memory checkpointer to enable future interrupts
     return builder.compile(checkpointer=get_checkpointer())
 
+
+def compile_flowchart_graph() -> StateGraph:
+    """Minimal graph for flowchart-only runs.
+
+    Pipeline: prepare_context -> generate_mermaid -> postprocess
+    Does not invoke PRD generation or HITL loop.
+    """
+    builder = StateGraph(AgentState)
+    builder.add_node("prepare_context", prepare_context)
+    builder.add_node("generate_mermaid", generate_mermaid)
+    builder.add_node("postprocess", postprocess)
+
+    builder.add_edge(START, "prepare_context")
+    builder.add_edge("prepare_context", "generate_mermaid")
+    builder.add_edge("generate_mermaid", "postprocess")
+    builder.add_edge("postprocess", END)
+
+    return builder.compile(checkpointer=get_checkpointer())

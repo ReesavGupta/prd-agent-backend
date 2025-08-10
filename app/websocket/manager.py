@@ -16,7 +16,7 @@ from app.models.chat import ChatSession
 from app.schemas.chat import WebSocketMessageRequest, WebSocketMessageResponse
 from app.services.chat_service import chat_service
 from app.agent.state import AgentState
-from app.agent.runtime import run_iteration, start_run, resume_run
+from app.agent.runtime import run_iteration, start_run, resume_run, start_flowchart_run
 from app.agent.commands import detect_rename_title, apply_prd_title_rename, is_pure_rename_title_command
 from app.services.ai_service import ai_service
 from app.services.cache_service import cache_service
@@ -47,6 +47,8 @@ class WebSocketManager:
         self.pending_interrupts: Dict[str, Dict[str, Any]] = {}
         # Run-in-flight indicator per chat (guards concurrent runs / races)
         self.run_in_flight: Dict[str, bool] = {}
+        # Flowchart-only run in-flight indicator per chat (separate lifecycle)
+        self.flow_run_in_flight: Dict[str, bool] = {}
 
     # --- Edit command helpers -------------------------------------------------
     _RENAME_PATTERNS = [
@@ -238,6 +240,48 @@ class WebSocketManager:
     ):
         """Handle send message request."""
         try:
+            # Flowchart-only mode does not require textual message 'content'
+            mode = data.get("mode")
+            if mode == "flowchart":
+                if self.flow_run_in_flight.get(chat_id):
+                    await self._send_error(websocket, "Flowchart generation is already in progress for this chat")
+                    return
+                base_prd_markdown = (data.get("base_prd_markdown") or "").strip()
+                if not base_prd_markdown:
+                    await self._send_error(websocket, "base_prd_markdown is required for flowchart mode")
+                    return
+                state = AgentState(
+                    project_id=str(data.get("project_id", "")),
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    base_prd_markdown=base_prd_markdown,
+                    base_mermaid=(data.get("base_mermaid") or ""),
+                    prd_markdown=base_prd_markdown,
+                    ws_chat_id=chat_id,
+                )
+                # Tag outgoing events as flowchart-kind
+                async def _send_event(evt: Dict[str, Any]) -> None:
+                    payload = dict(evt)
+                    try:
+                        d = payload.get("data") or {}
+                        if isinstance(d, dict) and d.get("kind") != "flowchart":
+                            d = {**d, "kind": "flowchart"}
+                            payload["data"] = d
+                    except Exception:
+                        pass
+                    await self._broadcast_to_chat(chat_id, payload)
+                state.send_event = _send_event  # type: ignore
+                # Kick off with a stream_start for UX
+                await self._broadcast_to_chat(chat_id, {"type": "stream_start", "data": {"project_id": state.project_id, "kind": "flowchart"}})
+                # Run minimal graph on separate thread namespace
+                self.flow_run_in_flight[chat_id] = True
+                try:
+                    await start_flowchart_run(state, thread_id=f"fc:{chat_id}")
+                finally:
+                    self.flow_run_in_flight[chat_id] = False
+                return
+
+            # Default conversational/agent modes require content
             content = data.get("content")
             if not content:
                 await self._send_error(websocket, "Message content is required")
@@ -639,22 +683,35 @@ class WebSocketManager:
         # Track pending interrupt lifecycle for auto-routing
         try:
             mtype = str(message.get("type"))
+            data_obj = message.get("data") or {}
+            kind = None
+            if isinstance(data_obj, dict):
+                kind = data_obj.get("kind")
             if mtype == "agent_interrupt_request":
-                data = message.get("data") or {}
-                if isinstance(data, dict) and data.get("question_id"):
-                    self.pending_interrupts[chat_id] = data
-                # While awaiting answer, the run is still considered in-flight
-                self.run_in_flight[chat_id] = True
+                # Ignore interrupts emitted by flowchart runs (there shouldn't be any)
+                if kind != "flowchart":
+                    if isinstance(data_obj, dict) and data_obj.get("question_id"):
+                        self.pending_interrupts[chat_id] = data_obj
+                    self.run_in_flight[chat_id] = True
             elif mtype == "agent_interrupt_cleared":
-                self.pending_interrupts.pop(chat_id, None)
+                if kind != "flowchart":
+                    self.pending_interrupts.pop(chat_id, None)
             elif mtype == "stream_start":
-                self.run_in_flight[chat_id] = True
+                if kind == "flowchart":
+                    self.flow_run_in_flight[chat_id] = True
+                else:
+                    self.run_in_flight[chat_id] = True
             elif mtype == "ai_response_complete":
-                # Mark no in-flight run only if no pending interrupt
-                if chat_id not in self.pending_interrupts:
-                    self.run_in_flight[chat_id] = False
+                if kind == "flowchart":
+                    self.flow_run_in_flight[chat_id] = False
+                else:
+                    if chat_id not in self.pending_interrupts:
+                        self.run_in_flight[chat_id] = False
             elif mtype == "error":
-                self.run_in_flight[chat_id] = False
+                if kind == "flowchart":
+                    self.flow_run_in_flight[chat_id] = False
+                else:
+                    self.run_in_flight[chat_id] = False
         except Exception:
             pass
 
