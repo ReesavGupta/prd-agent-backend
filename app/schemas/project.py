@@ -67,6 +67,9 @@ class UploadResponse(BaseModel):
     file_size: int = Field(...)
     content_type: str = Field(...)
     url: str = Field(...)
+    indexed: bool = Field(default=False)
+    index_error: Optional[str] = None
+    num_chunks: int = Field(default=0)
     uploaded_at: datetime = Field(...)
 
 

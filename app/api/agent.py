@@ -18,6 +18,8 @@ from app.services.chat_service import chat_service
 from app.services.ai_service import ai_service
 from app.dependencies import get_project_service
 from app.agent.runtime import resume_run
+from app.core.config import settings
+from app.services.cache_service import cache_service
 
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -360,6 +362,25 @@ async def save_artifacts(
 
         # Compose response
         etag = prd_upload.get("file_hash")  # simple etag from file hash
+        # Compute and cache PRD summary (persisted)
+        try:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+            # Simple summarization prompt:
+            sys = {"role": "system", "content": "Summarize the PRD concisely in 8-12 bullet points. No code fences."}
+            usr = {"role": "user", "content": prd_markdown[:18000]}
+            resp = await ai_service.generate_response(
+                user_id=str(current_user.id),
+                messages=[sys, usr],
+                temperature=0.2,
+                max_tokens=800,
+                use_cache=False,
+            )
+            if await cache_service.is_connected():
+                key = f"prd_summary:{project_id}:{etag}"
+                await cache_service.redis.setex(key, settings.PRD_SUMMARY_TTL_SECONDS, resp.content or "")
+        except Exception:
+            pass
+
         return BaseResponse.success(
             data={
                 "prd_url": prd_upload["url"],

@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
     OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY") 
     
+    # Vector store / Embeddings settings
+    PINECONE_API_KEY: Optional[str] = os.getenv("PINECONE_API_KEY")
+    PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "prd-agent-index")
+    PINECONE_ENVIRONMENT: str = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
+    PINECONE_ENDPOINT: Optional[str] = os.getenv("PINECONE_ENDPOINT")
+    NOMIC_API_KEY: Optional[str] = os.getenv("NOMIC_API_KEY")
+    
     # AI Configuration
     PRIMARY_AI_PROVIDER: str = "gemini"
     SECONDARY_AI_PROVIDER: str = "groq"
@@ -77,13 +84,17 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     
     # AI Rate Limiting (requests per minute per user)
-    AI_RATE_LIMIT_PER_USER: int = 50
-    AI_RATE_LIMIT_WINDOW_MINUTES: int = 1
+    AI_RATE_LIMIT_PER_USER: int = 1000000  # effectively disabled per user decision
+    AI_RATE_LIMIT_WINDOW_MINUTES: int = 60
     
     # AI Response Configuration
     AI_MAX_TOKENS: int = 4000
     AI_TEMPERATURE: float = 0.7
     AI_TIMEOUT_SECONDS: int = 60
+
+    # PRD summary cache TTLs (seconds)
+    PRD_SUMMARY_TTL_SECONDS: int = int(os.getenv("PRD_SUMMARY_TTL_SECONDS", str(24*3600)))
+    PRD_SUMMARY_EPHEMERAL_TTL_SECONDS: int = int(os.getenv("PRD_SUMMARY_EPHEMERAL_TTL_SECONDS", "1800"))
     
     # Streaming Configuration
     AI_STREAM_CHUNK_SIZE: int = 1024
@@ -121,6 +132,8 @@ class Settings(BaseSettings):
     @field_validator("REDIS_URL")
     def validate_redis_url(cls, v):
         """Validate Redis URL format."""
+        if v is None or v == "":
+            return v
         if not v.startswith("redis://") and not v.startswith("rediss://"):
             raise ValueError("REDIS_URL must start with 'redis://' or 'rediss://'")
         return v

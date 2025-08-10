@@ -34,26 +34,29 @@ class CloudinaryStorageRepository(FileStorageRepository):
         try:
             # Generate file hash for uniqueness
             file_hash = self.generate_file_hash(file_content)
-            
-            # Create storage key
-            storage_key = self.generate_storage_key(folder_path, filename, file_hash)
-            
+
+            # Build a base public_id WITHOUT folder path and WITHOUT extension.
+            # Folder path is passed separately via the 'folder' parameter.
+            name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+            hash_prefix = file_hash[:8]
+            public_id_base = f"{name_without_ext}_{hash_prefix}"
+
             # Prepare folder path with prefix
             full_folder = f"{settings.CLOUDINARY_FOLDER_PREFIX}/{folder_path}"
-            
+
             # Upload to Cloudinary
             result = uploader.upload(
                 io.BytesIO(file_content),
-                public_id=storage_key,
+                public_id=public_id_base,
                 folder=full_folder,
                 resource_type="auto",  # Auto-detect resource type
                 use_filename=False,
                 unique_filename=False,
                 overwrite=True
             )
-            
+
             return {
-                "storage_key": result["public_id"],
+                "storage_key": result["public_id"],  # includes folder in the resulting public_id
                 "url": result["secure_url"],
                 "size": result["bytes"],
                 "format": result.get("format", ""),

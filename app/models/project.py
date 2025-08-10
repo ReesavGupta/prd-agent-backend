@@ -85,6 +85,10 @@ class Upload(BaseModel):
     storage_key: str = Field(...)  # Cloudinary public_id
     url: Optional[str] = Field(default=None)  # File URL
     file_hash: str = Field(...)
+    indexed: bool = Field(default=False)
+    index_error: Optional[str] = Field(default=None)
+    num_chunks: int = Field(default=0)
+    embed_model: Optional[str] = Field(default=None)
     uploaded_at: datetime = Field(default_factory=datetime.utcnow)
 
     class Config:

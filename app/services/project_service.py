@@ -17,6 +17,11 @@ from app.schemas.project import (
 )
 from app.repositories.project import ProjectRepository
 from app.schemas.base import BaseResponse
+from app.core.config import settings
+from typing import Any
+import hashlib
+import logging
+import io
 
 
 class ProjectService:
@@ -56,14 +61,26 @@ class ProjectService:
             # Create project
             project = await self.project_repository.create_project(project_data)
 
-            # Handle file uploads if provided
+            # Handle file uploads if provided (index synchronously to avoid races)
             if files:
                 for file in files:
-                    await self._upload_file_to_project(
+                    upload = await self._upload_file_to_project(
                         str(project.id),
                         user_id,
                         file
                     )
+                    try:
+                        await self._index_upload_blocking(upload)
+                    except Exception as e:
+                        # Mark the error and fail creation request
+                        try:
+                            await self.project_repository.uploads_collection.update_one(
+                                {"_id": upload.id},
+                                {"$set": {"index_error": str(e)}}
+                            )
+                        except Exception:
+                            pass
+                        raise HTTPException(status_code=500, detail=f"Indexing failed for file {upload.filename}: {e}")
 
             return self._project_to_response(project)
 
@@ -183,12 +200,232 @@ class ProjectService:
         if not files:
             raise HTTPException(status_code=400, detail="No files provided")
 
-        uploads = []
+        uploads: List[UploadResponse] = []
         for file in files:
-            upload = await self._upload_file_to_project(project_id, user_id, file)
+            # Validate size and type (PDF-only, <= 5MB)
+            file_content = await file.read()
+            if len(file_content) > 5 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail=f"File {file.filename} exceeds maximum size of 5MB")
+            if (file.content_type or "").lower() != "application/pdf":
+                raise HTTPException(status_code=415, detail="Only PDF files are supported")
+
+            # Dedup by file hash per project
+            file_hash = self.project_repository.file_storage.generate_file_hash(file_content)
+            try:
+                logging.getLogger(__name__).info("[UPLOAD] received file: %s size=%d hash=%s", file.filename, len(file_content), file_hash[:12])
+            except Exception:
+                pass
+            # Attempt to find existing upload with same hash for this project
+            existing = await self.project_repository.uploads_collection.find_one({
+                "project_id": ProjectRepository.ObjectId(project_id) if hasattr(ProjectRepository, 'ObjectId') else None,
+            })
+            # NOTE: We cannot access ObjectId from repository easily here; fallback to raw query:
+            try:
+                from bson import ObjectId
+                existing = await self.project_repository.uploads_collection.find_one({
+                    "project_id": ObjectId(project_id),
+                    "file_hash": file_hash,
+                })
+            except Exception:
+                existing = None
+            if existing:
+                # If existing upload is not indexed, index it now synchronously
+                if not bool(existing.get("indexed")):
+                    try:
+                        await self._index_upload_blocking(Upload(**existing))
+                        # refresh existing doc
+                        existing = await self.project_repository.uploads_collection.find_one({"_id": existing["_id"]}) or existing
+                    except Exception as e:
+                        # surface error to caller to avoid returning unusable upload
+                        raise HTTPException(status_code=500, detail=f"Indexing failed for existing file {existing.get('filename')}: {e}")
+                uploads.append(await self._upload_to_response(Upload(**existing)))
+                continue
+
+            # Enforce page cap (30 pages) using PyMuPDF if available
+            try:
+                import fitz  # PyMuPDF
+                with fitz.open(stream=file_content, filetype="pdf") as doc:
+                    if doc.page_count > 30:
+                        raise HTTPException(status_code=413, detail=f"PDF exceeds maximum page limit (30). Got {doc.page_count}")
+            except HTTPException:
+                raise
+            except Exception:
+                # If PyMuPDF not available or fails to read, proceed (Cloudinary upload will still succeed)
+                pass
+
+            # Rewind content for upload path
+            file.file.seek(0)
+            upload = await self.project_repository.upload_file(
+                project_id=project_id,
+                user_id=user_id,
+                file_content=file_content,
+                filename=file.filename or "unknown.pdf",
+                content_type=file.content_type or "application/pdf",
+            )
+            # Index synchronously (blocking) to ensure immediate retrievability
+            try:
+                await self._index_upload_blocking(upload)
+                # Re-fetch updated upload doc for accurate response
+                try:
+                    from bson import ObjectId
+                    updated = await self.project_repository.uploads_collection.find_one({"_id": ObjectId(str(upload.id))})
+                    if updated:
+                        upload = Upload(**updated)
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    await self.project_repository.uploads_collection.update_one(
+                        {"_id": upload.id},
+                        {"$set": {"index_error": str(e)}}
+                    )
+                except Exception:
+                    pass
+                raise HTTPException(status_code=500, detail=f"Indexing failed for file {upload.filename}: {e}")
+
             uploads.append(await self._upload_to_response(upload))
 
         return uploads
+
+    async def _index_upload_blocking(self, upload: Upload) -> None:
+        """Index an uploaded file into Pinecone synchronously (blocking).
+
+        Supports PDFs (PyMuPDF), DOCX (docx2txt), Markdown/text (UTF-8 decode). Adds metadata
+        including project_id, file_id, filename for single-file retrieval via metadata filter.
+        """
+        try:
+            logger = logging.getLogger(__name__)
+            logger.info("[INDEX] start upload_id=%s project_id=%s filename=%s", str(upload.id), str(upload.project_id), upload.filename)
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+            from langchain_core.documents import Document
+            import httpx
+
+            # Fetch bytes using a signed URL when available (avoids 401 on protected assets)
+            try:
+                signed_url = await self.project_repository.file_storage.get_file_url(upload.storage_key, expires_in=300)
+            except Exception:
+                signed_url = upload.url or ""
+            if not signed_url:
+                raise RuntimeError("missing_file_url")
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.get(signed_url)
+                r.raise_for_status()
+                file_bytes = r.content
+
+            # Convert to text
+            text: str = ""
+            name_lower = (upload.filename or "").lower()
+            ctype = (upload.content_type or "").lower()
+            if ctype == "application/pdf" or name_lower.endswith(".pdf"):
+                try:
+                    import fitz  # PyMuPDF
+                except Exception:
+                    logger.exception("[INDEX] PyMuPDF import failed")
+                    raise
+                try:
+                    doc = fitz.open(stream=file_bytes, filetype="pdf")
+                    pages: list[str] = []
+                    for pno in range(doc.page_count):
+                        page = doc.load_page(pno)
+                        pages.append(page.get_text("text") or "")
+                    doc.close()
+                    text = "\n\n".join(pages)
+                except Exception:
+                    logger.exception("[INDEX] PDF parse failed upload_id=%s", str(upload.id))
+                    raise
+            elif name_lower.endswith(".docx") or ctype in (
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ):
+                try:
+                    import docx2txt
+                    text = docx2txt.process(io.BytesIO(file_bytes)) or ""
+                except Exception:
+                    logger.exception("[INDEX] DOCX parse failed upload_id=%s", str(upload.id))
+                    raise
+            else:
+                try:
+                    text = file_bytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    logger.exception("[INDEX] text decode failed upload_id=%s", str(upload.id))
+                    raise
+
+            text = (text or "").strip()
+            if not text:
+                raise RuntimeError("empty_text_after_parse")
+
+            # Split
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150, add_start_index=True)
+            chunks = splitter.split_documents([Document(page_content=text, metadata={"filename": upload.filename})])
+
+            # Enrich metadata
+            for d in chunks:
+                meta = d.metadata or {}
+                meta.update({
+                    "project_id": str(upload.project_id),
+                    "file_id": str(upload.id),
+                    "filename": upload.filename,
+                })
+                d.metadata = meta
+
+            # Vector store via rag_service (consistent embeddings)
+            try:
+                from app.services.rag_service import rag_service
+                store = rag_service._vector(namespace=str(upload.project_id))
+            except Exception:
+                logger.exception("[INDEX] vector store init failed")
+                raise
+
+            await store.aadd_documents(chunks)
+            logger.info("[INDEX] upserted chunks=%d upload_id=%s", len(chunks), str(upload.id))
+
+            # Mark as indexed
+            try:
+                embed_model = "nomic" if rag_service._use_nomic() else "openai"
+            except Exception:
+                embed_model = None
+            await self.project_repository.uploads_collection.update_one(
+                {"_id": upload.id},
+                {"$set": {"indexed": True, "num_chunks": len(chunks), "embed_model": embed_model}}
+            )
+            logger.info("[INDEX] completed upload_id=%s", str(upload.id))
+            # Broadcast over chat WS if project has a source_chat_id
+            try:
+                from bson import ObjectId
+                db = self.project_repository.database
+                proj = await db.projects.find_one({"_id": ObjectId(str(upload.project_id))})
+                chat_id = None
+                if proj:
+                    scid = proj.get("source_chat_id")
+                    if scid is not None:
+                        chat_id = str(scid)
+                if chat_id:
+                    from app.websocket.publisher import publish_to_chat
+                    await publish_to_chat(chat_id, {
+                        "type": "file_indexed",
+                        "data": {
+                            "project_id": str(upload.project_id),
+                            "file_id": str(upload.id),
+                            "filename": upload.filename,
+                            "num_chunks": len(chunks),
+                        }
+                    })
+                    logger.info("[INDEX] notified chat_id=%s about file_indexed", chat_id)
+                else:
+                    logger.info("[INDEX] no source_chat_id found for project_id=%s; skipping WS notify", str(upload.project_id))
+            except Exception:
+                logger.exception("[INDEX] failed to publish file_indexed event")
+        except Exception as e:
+            try:
+                logging.getLogger(__name__).exception("[INDEX] failed upload_id=%s error=%s", str(getattr(upload, 'id', '')), str(e))
+                await self.project_repository.uploads_collection.update_one(
+                    {"_id": upload.id},
+                    {"$set": {"index_error": str(e)}}
+                )
+            except Exception:
+                pass
+            # Propagate error
+            raise
 
     async def list_project_files(
         self,
@@ -328,5 +565,8 @@ class ProjectService:
             file_size=upload.file_size,
             content_type=upload.content_type,
             url=file_url,
-            uploaded_at=upload.uploaded_at
+            indexed=getattr(upload, "indexed", False),
+            index_error=getattr(upload, "index_error", None),
+            num_chunks=getattr(upload, "num_chunks", 0),
+            uploaded_at=upload.uploaded_at,
         )

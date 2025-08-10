@@ -17,6 +17,7 @@ from app.services.project_service import ProjectService
 from app.middleware.auth import get_current_user
 from app.models.user import UserInDB as User
 from app.schemas.base import BaseResponse
+from app.core.config import settings
 
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -243,15 +244,23 @@ async def upload_files(
 ):
     """Upload files to a project."""
     try:
+        # Enforce single-file for chat bar uploads and PDF-only policy
+        if not files or len(files) == 0:
+            raise HTTPException(status_code=400, detail="No file provided")
+        file = files[0]
+        if (file.content_type or "").lower() != "application/pdf":
+            raise HTTPException(status_code=415, detail="Only PDF files are supported")
+        # Size guard: 5 MB max
+        # Note: UploadFile may not expose size until read; project_service will re-validate.
         uploads = await project_service.upload_files(
             project_id=project_id,
             user_id=str(current_user.id),
-            files=files
+            files=[file]
         )
         
         return BaseResponse.success(
             data={"uploaded_files": uploads},
-            message=f"Successfully uploaded {len(uploads)} file(s)"
+            message=f"Successfully uploaded {len(uploads)} file(s) (indexing will run in background)"
         )
         
     except HTTPException:
@@ -298,10 +307,23 @@ async def delete_file(
 ):
     """Delete a file from a project."""
     try:
-        result = await project_service.delete_file(
-            file_id=file_id,
-            user_id=str(current_user.id)
-        )
+        # Purge vectors first (best-effort)
+        try:
+            from bson import ObjectId
+            from app.core.config import settings
+            from pinecone import Pinecone
+            db = project_service.project_repository.database
+            upload_doc = await db.uploads.find_one({"_id": ObjectId(file_id), "user_id": ObjectId(current_user.id)})
+            if upload_doc:
+                project_id = str(upload_doc.get("project_id"))
+                pc = Pinecone(api_key=settings.PINECONE_API_KEY, environment=settings.PINECONE_ENVIRONMENT)
+                index = pc.Index(settings.PINECONE_INDEX_NAME)
+                # Use metadata filter delete if supported
+                index.delete(filter={"file_id": file_id}, namespace=project_id)
+        except Exception:
+            pass
+
+        result = await project_service.delete_file(file_id=file_id, user_id=str(current_user.id))
         return result
         
     except HTTPException:

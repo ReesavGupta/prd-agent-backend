@@ -307,8 +307,12 @@ class ProjectRepository:
             "file_size": len(file_content),
             "content_type": content_type,
             "storage_key": upload_result["storage_key"],
-            "url": upload_result["url"],
+            "url": upload_result["url"],  # secure URL returned by Cloudinary
             "file_hash": file_hash,
+            "indexed": False,
+            "index_error": None,
+            "num_chunks": 0,
+            "embed_model": None,
             "uploaded_at": datetime.utcnow()
         }
         

@@ -217,9 +217,7 @@ class AIService:
                     timestamp=datetime.fromisoformat(cached_response["cached_at"])
                 )
         
-        # Check rate limit
-        if not await self.rate_limiter.check_rate_limit(user_id):
-            raise RateLimitError("AI rate limit exceeded. Please try again later.")
+        # Rate limiter removed per product decision
         
         # Convert messages to LangChain format
         langchain_messages = self._convert_messages_to_langchain(messages)
@@ -289,9 +287,7 @@ class AIService:
         **kwargs
     ) -> AsyncIterator[AIStreamChunk]:
         """Generate AI streaming response with provider failover."""
-        # Check rate limit
-        if not await self.rate_limiter.check_rate_limit(user_id):
-            raise RateLimitError("AI rate limit exceeded. Please try again later.")
+        # Rate limiter removed per product decision
         
         # Convert messages to LangChain format
         langchain_messages = self._convert_messages_to_langchain(messages)

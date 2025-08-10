@@ -18,6 +18,11 @@ from app.services.chat_service import chat_service
 from app.agent.state import AgentState
 from app.agent.runtime import run_iteration, start_run, resume_run
 from app.agent.commands import detect_rename_title, apply_prd_title_rename, is_pure_rename_title_command
+from app.services.ai_service import ai_service
+from app.services.cache_service import cache_service
+from app.services.rag_service import get_prd_summary, select_sections, retrieve_attachment
+from app.core.config import settings
+from app.db.database import get_database
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +341,9 @@ class WebSocketManager:
                 # Use HITL-capable start_run bound to thread_id=chat_id
                 await start_run(state, thread_id=chat_id)
                 return
+            if mode == "chat":
+                await self._handle_chat_mode(websocket, chat_id, user_id, data)
+                return
             
             # Create message request
             from app.schemas.chat import MessageCreateRequest
@@ -381,6 +389,132 @@ class WebSocketManager:
         except Exception as e:
             logger.error(f"Error handling send message: {e}")
             await self._send_error(websocket, "Failed to send message")
+
+    async def _handle_chat_mode(self, websocket: WebSocket, chat_id: str, user_id: str, data: dict) -> None:
+        """Handle chat mode with PRD-summary + optional single-file RAG over indexed PDF."""
+        try:
+            project_id = str(data.get("project_id") or "").strip()
+            content = str(data.get("content") or "").strip()
+            if not project_id:
+                await self._send_error(websocket, "project_id is required for chat mode")
+                return
+            # Echo user's message to room
+            logger.info("[CHAT] chat_mode recv chat_id=%s user_id=%s content_len=%d proj=%s attach=%s", chat_id, user_id, len(content or ""), project_id, bool(data.get("attachment_file_id")))
+            await self._broadcast_to_chat(chat_id, {
+                "type": "message_sent",
+                "data": {
+                    "message_id": str(uuid.uuid4()),
+                    "user_id": user_id,
+                    "content": content,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "message_type": "user",
+                },
+            })
+
+            # Gather PRD summary (from cache or ephemeral from provided prd_markdown)
+            prd_markdown = (data.get("prd_markdown") or "").strip()
+            summary_text = await get_prd_summary(project_id=project_id, user_id=user_id, prd_markdown=prd_markdown)
+
+            # Optional single-file RAG
+            attachment_file_id = (data.get("attachment_file_id") or "").strip()
+            retrieved_text = ""
+            indexing_in_progress = False
+            if attachment_file_id:
+                try:
+                    from bson import ObjectId
+                    db = get_database()
+                    upload_doc = await db.uploads.find_one({"_id": ObjectId(attachment_file_id), "project_id": ObjectId(project_id)})
+                    if upload_doc and upload_doc.get("indexed"):
+                        logger.info("[CHAT] retrieval using file_id=%s", attachment_file_id)
+                        retrieved_text = await retrieve_attachment(project_id=project_id, file_id=attachment_file_id, query=content)
+                    else:
+                        logger.info("[CHAT] attachment not indexed yet file_id=%s", attachment_file_id)
+                        indexing_in_progress = True
+                except Exception:
+                    pass
+
+            # Optional assistant preface if indexing not ready
+            if indexing_in_progress:
+                try:
+                    await self._broadcast_to_chat(chat_id, {
+                        "type": "message_sent",
+                        "data": {
+                            "message_id": f"p:{int(datetime.utcnow().timestamp()*1000)}",
+                            "user_id": user_id,
+                            "content": "Indexing in progress for the attached document. Answering from PRD only.",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "message_type": "assistant",
+                        },
+                    })
+                except Exception:
+                    pass
+
+            # Section spotlights (lightweight classifier using headings from PRD markdown if provided)
+            prd_section_spotlights = ""
+            try:
+                if prd_markdown:
+                    prd_section_spotlights = await select_sections(prd_markdown=prd_markdown, question=content, user_id=user_id)
+            except Exception:
+                prd_section_spotlights = ""
+
+            # Build prompt
+            context_blocks = []
+            if summary_text:
+                context_blocks.append(f"PRD Summary:\n{summary_text}")
+            if prd_section_spotlights:
+                context_blocks.append(f"PRD Sections:\n{prd_section_spotlights}")
+            if retrieved_text:
+                context_blocks.append(f"Document Snippets:\n{retrieved_text}")
+            context_str = "\n\n".join(context_blocks) if context_blocks else "(no context)"
+
+            system_msg = {
+                "role": "system",
+                "content": (
+                    "You are a concise product assistant. Use ONLY the provided context to answer the user's question. "
+                    "If the answer is not present, say you don't have enough information. Keep answers brief and specific."
+                ),
+            }
+            user_msg = {"role": "user", "content": f"Context:\n{context_str}\n\nQuestion:\n{content}"}
+
+            await self._broadcast_to_chat(chat_id, {"type": "stream_start", "data": {"project_id": project_id}})
+            final_text = []
+            last_provider = None
+            last_model = None
+            try:
+                async for chunk in ai_service.generate_stream(
+                    user_id=user_id,
+                    messages=[system_msg, user_msg],
+                    temperature=0.2,
+                    max_tokens=800,
+                ):
+                    if chunk.is_complete:
+                        await self._broadcast_to_chat(chat_id, {
+                            "type": "ai_response_streaming",
+                            "data": {"delta": "", "is_complete": True, "provider": chunk.provider, "model": chunk.model},
+                        })
+                        last_provider = chunk.provider
+                        last_model = chunk.model
+                        break
+                    delta = chunk.content or ""
+                    final_text.append(delta)
+                    last_provider = chunk.provider
+                    last_model = chunk.model
+                    await self._broadcast_to_chat(chat_id, {
+                        "type": "ai_response_streaming",
+                        "data": {"delta": delta, "is_complete": False, "provider": chunk.provider, "model": chunk.model},
+                    })
+            except Exception as e:
+                logger.error("[CHAT] generation failed: %s", e)
+                await self._send_error(websocket, f"Generation failed: {e}")
+                return
+
+            await self._broadcast_to_chat(chat_id, {
+                "type": "ai_response_complete",
+                "data": {"message": "", "provider": last_provider, "model": last_model},
+            })
+        except Exception as e:
+            logger.error(f"chat_mode error: {e}")
+            await self._send_error(websocket, "Chat mode processing failed")
     
     async def _handle_agent_resume(
         self,
