@@ -7,6 +7,8 @@ import logging
 import re
 import json
 from app.services.ai_service import ai_service
+from app.agent.commands import detect_rename_title, apply_prd_title_rename
+from app.agent.intent import classify_intent, verify_is_answer
 from functools import lru_cache
 from pathlib import Path
 import time
@@ -617,6 +619,9 @@ def analyze_gaps(state: AgentState) -> AgentState:
 
 async def propose_next_question(state: AgentState) -> AgentState:
     """Select the earliest incomplete PRD section and ask a guided question with required phrasing."""
+    # If there is already a pending question (including a confirmation), do not propose a new one
+    if state.pending_question:
+        return state
     if (state.telemetry or {}).get("should_finish"):
         state.pending_question = None
         return state
@@ -744,17 +749,27 @@ async def propose_next_question(state: AgentState) -> AgentState:
         phrased = specialized_q
     else:
         phrased = _tailored_fallback(idea_text, target, base) if idea_text else f"{target}: {base}"
+    qid = f"sec_{order.index(target)+1}"
     state.pending_question = {
-        "id": f"sec_{order.index(target)+1}",
+        "id": qid,
         "question": phrased,
         "section": target,
         "rationale": f"Fill out the '{target}' section with concrete details.",
     }
+    state.pending_question_kind = "section"
+    state.last_section_target = target
+    state.last_section_question = phrased
+    state.last_section_qid = qid
     return state
 
 
 async def await_human_answer(state: AgentState) -> AgentState:
-    """Pause the graph and request human input using LangGraph interrupt()."""
+    """Pause the graph and request human input using LangGraph interrupt().
+
+    Enhancement: classify the next user message before proceeding. If the user
+    sends a generic query instead of a direct answer, address it first and ask
+    permission to proceed with the pending section question.
+    """
     if not state.pending_question:
         return state
     payload = {
@@ -806,22 +821,489 @@ async def await_human_answer(state: AgentState) -> AgentState:
         pass
 
     response = interrupt(payload)
-    # Expected resume shapes:
+    # Expected resume shapes (extended):
     # - {"type": "answer", "question_id": str, "text": str}
-    # - {"type": "accept", "finish"?: bool} (skip/finish)
+    # - {"type": "accept", "finish"?: bool}
+    # - {"type": "message", "text": str}  # generic/free-form message
     state.telemetry = {**(state.telemetry or {}), "last_interrupt": payload}
+
+    def _looks_like_direct_answer(text: str, section: str, question: str) -> bool:
+        t = (text or "").strip()
+        tl = t.lower()
+        # must have enough content and not be a question
+        if len(tl) < 12:
+            return False
+        if tl.endswith("?"):
+            return False
+        # filter common command/generic prefixes
+        command_starts = (
+            "rename ", "change ", "set ", "summarize ", "make ", "can you ", "please ", "could you ", "what is ", "how ",
+        )
+        if tl.startswith(command_starts):
+            return False
+        # avoid pure confirmations
+        if tl in {"ok", "okay", "yes", "no", "maybe", "sure", "fine", "later"}:
+            return False
+        # don't treat a pure echo of the question as an answer
+        if question:
+            ql = question.strip().lower().rstrip("? .")
+            if ql and ql in tl and len(t.split()) < 8:
+                return False
+        # light section keyword check for metrics
+        key = _canonicalize_heading_key(section)
+        if key.startswith("11. "):
+            if ("kpi" not in tl) and ("metric" not in tl) and ("target" not in tl):
+                return False
+        return True
+
     if isinstance(response, dict) and response.get("type") == "answer":
+        # Direct answer path (explicit)
+        try:
+            from app.websocket.publisher import publish_to_chat
+            if state.ws_chat_id:
+                qid_clear = (state.pending_question.get("id") if state.pending_question else None) or state.last_section_qid or ""
+                if qid_clear:
+                    await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_cleared", "data": {"question_id": qid_clear}})
+        except Exception:
+            pass
         state.answered_qa.append({
             "question": state.pending_question.get("question", ""),
             "answer": response.get("text", ""),
             "section": state.pending_question.get("section"),
         })
-    elif isinstance(response, dict) and response.get("type") == "accept":
-        # Mark finish on request
+        state.pending_question = None
+        state.pending_question_kind = None
+        return state
+
+    if isinstance(response, dict) and response.get("type") == "accept":
+        # User chose to skip/finish
         if response.get("finish"):
             state.telemetry = {**(state.telemetry or {}), "force_finish": True}
-    # Clear pending question regardless; next node decides what to do
-    state.pending_question = None
+        try:
+            from app.websocket.publisher import publish_to_chat
+            if state.ws_chat_id:
+                qid_clear = (state.pending_question.get("id") if state.pending_question else None) or state.last_section_qid or ""
+                if qid_clear:
+                    await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_cleared", "data": {"question_id": qid_clear}})
+        except Exception:
+            pass
+        state.pending_question = None
+        state.pending_question_kind = None
+        return state
+
+    # Fallback: treat as a generic message requiring classification/handling
+    if isinstance(response, dict) and response.get("type") == "message":
+        from app.websocket.publisher import publish_to_chat  # local import to avoid cycles
+
+        def _looks_like_yes(text: str) -> bool:
+            t = (text or "").strip().lower()
+            return t in {"yes", "y", "ok", "okay", "sure", "yep", "proceed", "continue", "go ahead", "do it"} or t.startswith("yes") or t.startswith("ok")
+
+        def _looks_like_no(text: str) -> bool:
+            t = (text or "").strip().lower()
+            return t in {"no", "n", "skip", "later", "not now", "stop"} or t.startswith("no ") or "not now" in t
+
+        # Keep looping interrupts until we either collect an answer or the user declines
+        current = response
+        while isinstance(current, dict) and current.get("type") == "message":
+            user_text = str(current.get("text") or "").strip()
+            state.last_user_message = user_text
+            sec = state.pending_question.get("section") if state.pending_question else (state.last_section_target or "")
+            qtxt = state.pending_question.get("question") if state.pending_question else (state.last_section_question or "")
+            qid = state.pending_question.get("id") if state.pending_question else (state.last_section_qid or "")
+
+            # Use LLM intent classification first
+            try:
+                intent, args = await classify_intent(
+                    user_id=state.user_id,
+                    user_text=user_text,
+                    section=sec,
+                    question=qtxt,
+                    idea=state.idea,
+                    recent_qa=state.answered_qa,
+                )
+            except Exception:
+                intent, args = ("generic", {})
+
+            # Handle rename_title intent
+            if intent == "rename_title":
+                new_title = (args or {}).get("new_title") or detect_rename_title(user_text)
+                if not new_title:
+                    # Nothing to do; treat as generic
+                    intent = "generic"
+                else:
+                    try:
+                        state.prd_markdown = apply_prd_title_rename(state.prd_markdown, str(new_title))
+                        if state.ws_chat_id:
+                            await publish_to_chat(state.ws_chat_id, {
+                                "type": "artifacts_preview",
+                                "data": {
+                                    "prd_markdown": state.prd_markdown,
+                                    "mermaid": None,
+                                    "sections_status": state.sections_status or {},
+                                },
+                            })
+                            await publish_to_chat(state.ws_chat_id, {
+                                "type": "message_sent",
+                                "data": {
+                                    "message_id": f"t:{int(time.time()*1000)}",
+                                    "user_id": state.user_id,
+                                    "content": f"Renamed PRD title to '{new_title}'.",
+                                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                                    "message_type": "assistant",
+                                },
+                            })
+                        # Ask to proceed with section question
+                        proceed_text = f"Would you like to proceed with the PRD question for '{sec}' now?"
+                        if state.ws_chat_id:
+                            await publish_to_chat(state.ws_chat_id, {
+                                "type": "message_sent",
+                                "data": {
+                                    "message_id": f"p:{qid}",
+                                    "user_id": state.user_id,
+                                    "content": proceed_text,
+                                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                                    "message_type": "assistant",
+                                },
+                            })
+                        state.pending_question_kind = "confirm"
+                        state.pending_question = {
+                            "id": qid,
+                            "question": f"Proceed with section '{sec}'?",
+                            "section": sec,
+                            "rationale": "Confirm before resuming PRD updates.",
+                        }
+                        current = interrupt({"type": "confirm", "question_id": qid, "section": sec})
+                        continue
+                    except Exception:
+                        # If rename fails, treat as generic below
+                        intent = "generic"
+
+            # Confirm intents
+            if intent == "confirm_yes" and (state.pending_question_kind or "") == "confirm":
+                # Re-ask the original section question and pause
+                question_payload = {
+                    "type": "question",
+                    "question": state.last_section_question or qtxt,
+                    "section": state.last_section_target or sec,
+                    "question_id": state.last_section_qid or qid,
+                    "rationale": state.pending_question.get("rationale") if state.pending_question else None,
+                }
+                if state.ws_chat_id and (state.last_section_qid or qid):
+                    await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_request", "data": question_payload})
+                    msg_text = (state.last_section_question or qtxt or "").strip()
+                    if msg_text:
+                        await publish_to_chat(state.ws_chat_id, {
+                            "type": "message_sent",
+                            "data": {
+                                "message_id": f"q:{state.last_section_qid or qid}",
+                                "user_id": state.user_id,
+                                "content": msg_text,
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "message_type": "assistant",
+                            },
+                        })
+                state.pending_question_kind = "section"
+                state.pending_question = {
+                    "id": state.last_section_qid or qid,
+                    "question": state.last_section_question or qtxt,
+                    "section": state.last_section_target or sec,
+                    "rationale": state.pending_question.get("rationale") if state.pending_question else None,
+                }
+                current = interrupt(question_payload)
+                continue
+
+            if intent == "confirm_no" and (state.pending_question_kind or "") == "confirm":
+                if state.ws_chat_id:
+                    await publish_to_chat(state.ws_chat_id, {
+                        "type": "message_sent",
+                        "data": {
+                            "message_id": f"a:{int(time.time()*1000)}",
+                            "user_id": state.user_id,
+                            "content": "No problem — we can continue when you're ready.",
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "message_type": "assistant",
+                        },
+                    })
+                state.pending_question = None
+                state.pending_question_kind = None
+                return state
+                try:
+                    # Apply rename to current PRD in state and emit artifacts update
+                    state.prd_markdown = apply_prd_title_rename(state.prd_markdown, new_title)
+                    if state.ws_chat_id:
+                        await publish_to_chat(state.ws_chat_id, {
+                            "type": "artifacts_preview",
+                            "data": {
+                                "prd_markdown": state.prd_markdown,
+                                "mermaid": None,
+                                "sections_status": state.sections_status or {},
+                            },
+                        })
+                        # Also inform chat with a short assistant message
+                        await publish_to_chat(state.ws_chat_id, {
+                            "type": "message_sent",
+                            "data": {
+                                "message_id": f"t:{int(time.time()*1000)}",
+                                "user_id": state.user_id,
+                                "content": f"Renamed PRD title to '{new_title}'.",
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "message_type": "assistant",
+                            },
+                        })
+                        # Ask permission to proceed with section question
+                        proceed_text = f"Would you like to proceed with the PRD question for '{sec}' now?"
+                        await publish_to_chat(state.ws_chat_id, {
+                            "type": "message_sent",
+                            "data": {
+                                "message_id": f"p:{qid}",
+                                "user_id": state.user_id,
+                                "content": proceed_text,
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "message_type": "assistant",
+                            },
+                        })
+                    state.pending_question_kind = "confirm"
+                    state.pending_question = {
+                        "id": qid,
+                        "question": f"Proceed with section '{sec}'?",
+                        "section": sec,
+                        "rationale": "Confirm before resuming PRD updates.",
+                    }
+                    current = interrupt({"type": "confirm", "question_id": qid, "section": sec})
+                    continue
+                except Exception:
+                    # On error, continue with generic handling below
+                    pass
+
+            if (state.pending_question_kind or "") == "confirm":
+                if _looks_like_yes(user_text):
+                    # Re-ask the original section question and pause for an explicit answer
+                    question_payload = {
+                        "type": "question",
+                        "question": state.last_section_question or qtxt,
+                        "section": state.last_section_target or sec,
+                        "question_id": state.last_section_qid or qid,
+                        "rationale": state.pending_question.get("rationale") if state.pending_question else None,
+                    }
+                    if state.ws_chat_id and (state.last_section_qid or qid):
+                        await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_request", "data": question_payload})
+                        msg_text = (state.last_section_question or qtxt or "").strip()
+                        if msg_text:
+                            await publish_to_chat(state.ws_chat_id, {
+                                "type": "message_sent",
+                                "data": {
+                                    "message_id": f"q:{state.last_section_qid or qid}",
+                                    "user_id": state.user_id,
+                                    "content": msg_text,
+                                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                                    "message_type": "assistant",
+                                },
+                            })
+                    # Reset pending to the original section question and pause again
+                    state.pending_question_kind = "section"
+                    state.pending_question = {
+                        "id": state.last_section_qid or qid,
+                        "question": state.last_section_question or qtxt,
+                        "section": state.last_section_target or sec,
+                        "rationale": state.pending_question.get("rationale") if state.pending_question else None,
+                    }
+                    current = interrupt(question_payload)
+                    # Loop back to process the new "current" response
+                    continue
+                if _looks_like_no(user_text):
+                    # Respect user's choice; clear pending and acknowledge
+                    if state.ws_chat_id:
+                        await publish_to_chat(state.ws_chat_id, {
+                            "type": "message_sent",
+                            "data": {
+                                "message_id": f"a:{int(time.time()*1000)}",
+                                "user_id": state.user_id,
+                                "content": "No problem — we can continue when you're ready.",
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "message_type": "assistant",
+                            },
+                        })
+                        try:
+                            qid_clear = state.last_section_qid or qid
+                            if qid_clear:
+                                await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_cleared", "data": {"question_id": qid_clear}})
+                        except Exception:
+                            pass
+                    state.pending_question = None
+                    state.pending_question_kind = None
+                    return state
+                # Ask for explicit confirmation again
+                if state.ws_chat_id and (state.last_section_target or sec):
+                    tip = f"If you'd like to proceed with the PRD question for '{state.last_section_target or sec}', reply 'yes'. Otherwise ask me anything."
+                    await publish_to_chat(state.ws_chat_id, {
+                        "type": "message_sent",
+                        "data": {
+                            "message_id": f"h:{int(time.time()*1000)}",
+                            "user_id": state.user_id,
+                            "content": tip,
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "message_type": "assistant",
+                        },
+                    })
+                current = interrupt({"type": "confirm", "question_id": state.last_section_qid or qid, "section": state.last_section_target or sec})
+                continue
+
+            # Section rename intent (update heading text) – robustly locate by number or exact heading match
+            if intent == "rename_section_heading":
+                new_heading = (args or {}).get("new_heading")
+                section_ref = (args or {}).get("section_ref")
+                try:
+                    # Use the existing parser to find the section range reliably
+                    if not new_heading:
+                        raise ValueError("new_heading missing")
+                    # Determine target section by reference or current 'sec'
+                    target_section = None
+                    if isinstance(section_ref, str) and section_ref.strip():
+                        # Find by ordinal prefix "1"/"1." or exact heading match
+                        ref = section_ref.strip().rstrip('.')
+                        sections = _parse_sections_from_markdown(state.prd_markdown)
+                        for head, s_idx, e_idx in sections:
+                            key = _canonicalize_heading_key(head)
+                            if key.startswith(f"{ref}. ") or key == _canonicalize_heading_key(head):
+                                target_section = head
+                                break
+                    if not target_section and sec:
+                        target_section = sec
+                    if not target_section:
+                        # fallback: use the current question's section
+                        target_section = sec or "1. Product Overview / Purpose"
+
+                    # Replace the heading line text of the found section
+                    start, end, lines, found = _find_section_range(state.prd_markdown, target_section)
+                    if start != -1:
+                        # heading is the line just before start
+                        heading_idx = start - 1
+                        if heading_idx >= 0 and lines[heading_idx].strip().startswith("###"):
+                            lines[heading_idx] = f"### {new_heading}"
+                            state.prd_markdown = "\n".join(lines)
+                        else:
+                            # If unable to find heading line, prepend a new one before body
+                            updated = lines[:start] + [f"### {new_heading}", ""] + lines[start:]
+                            state.prd_markdown = "\n".join(updated)
+                    else:
+                        # If section not found, append a new one at end
+                        state.prd_markdown = _replace_section_body(state.prd_markdown, new_heading, "")
+
+                        if state.ws_chat_id:
+                            await publish_to_chat(state.ws_chat_id, {
+                                "type": "artifacts_preview",
+                                "data": {"prd_markdown": state.prd_markdown, "mermaid": None, "sections_status": state.sections_status or {}},
+                            })
+                            await publish_to_chat(state.ws_chat_id, {
+                                "type": "message_sent",
+                                "data": {"message_id": f"h:{int(time.time()*1000)}", "user_id": state.user_id, "content": f"Section heading updated to '{new_heading}'.", "timestamp": datetime.utcnow().isoformat() + "Z", "message_type": "assistant"},
+                            })
+                        # Ask to proceed
+                        if state.ws_chat_id:
+                            await publish_to_chat(state.ws_chat_id, {
+                                "type": "message_sent",
+                                "data": {"message_id": f"p:{qid}", "user_id": state.user_id, "content": f"Proceed with the PRD question for '{sec}' now?", "timestamp": datetime.utcnow().isoformat() + "Z", "message_type": "assistant"},
+                            })
+                        state.pending_question_kind = "confirm"
+                        state.pending_question = {"id": qid, "question": f"Proceed with section '{sec}'?", "section": sec, "rationale": "Confirm before resuming PRD updates."}
+                        current = interrupt({"type": "confirm", "question_id": qid, "section": sec})
+                        continue
+                except Exception:
+                    pass
+
+            # Not in confirm mode yet → classify as answer vs generic using LLM outcome first and a verifier
+            is_answer = (intent == "answer")
+            if not is_answer:
+                # Ask the LLM to verify strictly if it's an answer
+                is_answer = await verify_is_answer(state.user_id, user_text, sec or "", qtxt or "")
+            if is_answer or _looks_like_direct_answer(user_text, sec or "", qtxt or ""):
+                state.answered_qa.append({
+                    "question": qtxt or (state.pending_question.get("question", "") if state.pending_question else ""),
+                    "answer": user_text,
+                    "section": sec or (state.pending_question.get("section") if state.pending_question else ""),
+                })
+                # Clear interrupt
+                try:
+                    if state.ws_chat_id:
+                        await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_cleared", "data": {"question_id": state.last_section_qid or qid}})
+                except Exception:
+                    pass
+                state.pending_question = None
+                state.pending_question_kind = None
+                return state
+
+            # Generic: answer briefly, then request permission to proceed
+            if state.ws_chat_id and user_text:
+                sys = {"role": "system", "content": "Answer the user's question briefly and helpfully in one sentence."}
+                usr = {"role": "user", "content": user_text}
+                try:
+                    resp = await ai_service.generate_response(user_id=state.user_id, messages=[sys, usr], temperature=0.2, max_tokens=120)
+                    brief = (resp.content or "").strip()
+                except Exception:
+                    brief = "Got it."
+                await publish_to_chat(state.ws_chat_id, {
+                    "type": "message_sent",
+                    "data": {
+                        "message_id": f"g:{int(time.time()*1000)}",
+                        "user_id": state.user_id,
+                        "content": brief or "Got it.",
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "message_type": "assistant",
+                    },
+                })
+                proceed_text = f"Would you like to proceed with the PRD question for '{sec}' now?"
+                await publish_to_chat(state.ws_chat_id, {
+                    "type": "message_sent",
+                    "data": {
+                        "message_id": f"p:{qid}",
+                        "user_id": state.user_id,
+                        "content": proceed_text,
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "message_type": "assistant",
+                    },
+                })
+            state.pending_question_kind = "confirm"
+            state.pending_question = {
+                "id": qid,
+                "question": f"Proceed with section '{sec}'?",
+                "section": sec,
+                "rationale": "Confirm before resuming PRD updates.",
+            }
+            current = interrupt({"type": "confirm", "question_id": qid, "section": sec})
+            # Loop will continue and handle the confirmation path
+
+        # If we exit the loop, handle any non-message current
+        if isinstance(current, dict) and current.get("type") == "answer":
+            state.answered_qa.append({
+                "question": state.last_section_question or (state.pending_question.get("question", "") if state.pending_question else ""),
+                "answer": current.get("text", ""),
+                "section": state.last_section_target or (state.pending_question.get("section") if state.pending_question else ""),
+            })
+            # Clear interrupt
+            try:
+                if state.ws_chat_id:
+                    await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_cleared", "data": {"question_id": state.last_section_qid or (state.pending_question.get("id") if state.pending_question else "")}})
+            except Exception:
+                pass
+            state.pending_question = None
+            state.pending_question_kind = None
+            return state
+        if isinstance(current, dict) and current.get("type") == "accept":
+            if current.get("finish"):
+                state.telemetry = {**(state.telemetry or {}), "force_finish": True}
+            try:
+                if state.ws_chat_id:
+                    await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_cleared", "data": {"question_id": state.last_section_qid or (state.pending_question.get("id") if state.pending_question else "")}})
+            except Exception:
+                pass
+            state.pending_question = None
+            state.pending_question_kind = None
+            return state
+        # Unknown shape → keep waiting (no state change)
+        return state
+
+    # Unknown shape: keep waiting (no state change)
     return state
 
 

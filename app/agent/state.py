@@ -37,7 +37,15 @@ class AgentState(BaseModel):
     iteration_index: int = 0
     answered_qa: List[Dict[str, str]] = Field(default_factory=list)
     pending_question: Optional[Dict[str, Any]] = None
+    # Distinguish what kind of pending question is active (e.g., 'section' or 'confirm')
+    pending_question_kind: Optional[str] = None
     asked_questions: List[str] = Field(default_factory=list)
+    # Store the last human message received while waiting at an interrupt
+    last_user_message: Optional[str] = None
+    # Track last asked section/question so we can classify later messages against it
+    last_section_target: Optional[str] = None
+    last_section_question: Optional[str] = None
+    last_section_qid: Optional[str] = None
     completion_targets: Dict[str, Any] = Field(
         default_factory=lambda: {
             # Section-based completion targets aligned to PRD template

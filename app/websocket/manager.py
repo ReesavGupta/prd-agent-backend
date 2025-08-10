@@ -17,6 +17,7 @@ from app.schemas.chat import WebSocketMessageRequest, WebSocketMessageResponse
 from app.services.chat_service import chat_service
 from app.agent.state import AgentState
 from app.agent.runtime import run_iteration, start_run, resume_run
+from app.agent.commands import detect_rename_title, apply_prd_title_rename, is_pure_rename_title_command
 
 logger = logging.getLogger(__name__)
 
@@ -240,11 +241,11 @@ class WebSocketManager:
             # Agent mode: run LangGraph per-message iteration and stream back to sender
             mode = data.get("mode")
             if mode == "agent":
-                # If a question is pending for this chat, interpret this message as the answer and resume
+                # If a question is pending for this chat, forward raw message into the agent thread for classification
                 pending = self.pending_interrupts.get(chat_id)
                 if pending:
                     try:
-                        # Echo user's answer into chat stream
+                        # Echo user's message into chat stream
                         await self._broadcast_to_chat(chat_id, {
                             "type": "message_sent",
                             "data": {
@@ -255,17 +256,11 @@ class WebSocketManager:
                                 "message_type": "user"
                             }
                         })
-                        # Clear interrupt and resume the agent thread
-                        await self._broadcast_to_chat(chat_id, {
-                            "type": "agent_interrupt_cleared",
-                            "data": {"question_id": str(pending.get("question_id"))}
-                        })
-                        # Remove pending marker
-                        self.pending_interrupts.pop(chat_id, None)
-                        await resume_run(chat_id, {"type": "answer", "question_id": str(pending.get("question_id")), "text": content})
+                        # Do NOT clear interrupt here. Let the graph classify whether this is an answer or a generic query
+                        await resume_run(chat_id, {"type": "message", "text": content})
                         return
                     except Exception as e:
-                        logger.error(f"Error auto-resuming pending interrupt: {e}")
+                        logger.error(f"Error forwarding message to pending interrupt: {e}")
                         # If resume fails, fall back to starting a fresh run below
 
                 # If a run is in-flight but pending hasn't been recorded yet, wait briefly for interrupt
@@ -287,15 +282,10 @@ class WebSocketManager:
                                     "message_type": "user"
                                 }
                             })
-                            await self._broadcast_to_chat(chat_id, {
-                                "type": "agent_interrupt_cleared",
-                                "data": {"question_id": str(pending.get("question_id"))}
-                            })
-                            self.pending_interrupts.pop(chat_id, None)
-                            await resume_run(chat_id, {"type": "answer", "question_id": str(pending.get("question_id")), "text": content})
+                            await resume_run(chat_id, {"type": "message", "text": content})
                             return
                         except Exception as e:
-                            logger.error(f"Error resuming after grace wait: {e}")
+                            logger.error(f"Error resuming after grace wait (message forward): {e}")
                     # Still busy: reject starting a new run to avoid duplicate questions
                     await self._send_error(websocket, "Agent is busy processing. Please wait for the question to appear, then reply.")
                     return
@@ -303,13 +293,13 @@ class WebSocketManager:
                 # Build state from client-provided context and stream via this websocket
                 # Apply deterministic edit commands (e.g., rename PRD title) before starting a run
                 base_prd_markdown = (data.get("base_prd_markdown", "") or "")
-                rename_to = self._extract_rename_title(content or "")
+                rename_to = detect_rename_title(content or "")
                 if rename_to:
                     try:
                         # Apply deterministic rename locally
-                        base_prd_markdown = self._rename_prd_title(base_prd_markdown, rename_to)
+                        base_prd_markdown = apply_prd_title_rename(base_prd_markdown, rename_to)
                         # If the message is a pure rename command, reflect immediately and do not start a run
-                        if any(pat.match(content or "") for pat in self._RENAME_PATTERNS):
+                        if is_pure_rename_title_command(content or ""):
                             await self._broadcast_to_chat(chat_id, {
                                 "type": "artifacts_preview",
                                 "data": {
