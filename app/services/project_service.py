@@ -19,6 +19,7 @@ from app.repositories.project import ProjectRepository
 from app.schemas.base import BaseResponse
 from app.core.config import settings
 from typing import Any
+import os
 import hashlib
 import logging
 import io
@@ -262,6 +263,11 @@ class ProjectService:
                 filename=file.filename or "unknown.pdf",
                 content_type=file.content_type or "application/pdf",
             )
+            # Pass original bytes to indexer to avoid HTTP fetch (Cloudinary 401 issues)
+            try:
+                setattr(upload, "_provided_bytes", file_content)
+            except Exception:
+                pass
             # Index synchronously (blocking) to ensure immediate retrievability
             try:
                 await self._index_upload_blocking(upload)
@@ -300,17 +306,75 @@ class ProjectService:
             from langchain_core.documents import Document
             import httpx
 
-            # Fetch bytes using a signed URL when available (avoids 401 on protected assets)
-            try:
-                signed_url = await self.project_repository.file_storage.get_file_url(upload.storage_key, expires_in=300)
-            except Exception:
-                signed_url = upload.url or ""
-            if not signed_url:
-                raise RuntimeError("missing_file_url")
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.get(signed_url)
-                r.raise_for_status()
-                file_bytes = r.content
+            # Fetch bytes using local path (local storage) or Cloudinary signed URL with correct resource_type
+            file_bytes: bytes
+            if hasattr(upload, "_provided_bytes") and getattr(upload, "_provided_bytes"):
+                file_bytes = getattr(upload, "_provided_bytes")  # type: ignore[attr-defined]
+            else:
+                # First, try local file scheme via stored URL if present
+                url_candidate = (upload.url or "").strip()
+                if url_candidate.startswith("file://"):
+                    try:
+                        from urllib.parse import urlsplit
+                        split = urlsplit(url_candidate)
+                        local_path = split.path
+                        if os.name == "nt" and local_path.startswith("/") and ":" in local_path[1:3]:
+                            local_path = local_path[1:]
+                        with open(local_path, "rb") as f:
+                            file_bytes = f.read()
+                    except Exception:
+                        logger.exception("[INDEX] failed to read local file URL: %s", url_candidate)
+                        raise
+                else:
+                    # Cloudinary (or other HTTP URL) path — generate a signed URL with correct resource_type if possible
+                    signed_url: str = ""
+                    cloud_attempted = False
+                    try:
+                        from app.repositories.cloudinary_storage import CloudinaryStorageRepository  # type: ignore
+                        if isinstance(self.project_repository.file_storage, CloudinaryStorageRepository):
+                            cloud_attempted = True
+                            # Map content-type to Cloudinary resource_type
+                            ctype = (upload.content_type or "").lower()
+                            if ctype.startswith("image/"):
+                                rt_order = ["image", "raw", "video"]
+                            elif ctype.startswith("video/"):
+                                rt_order = ["video", "raw", "image"]
+                            else:
+                                rt_order = ["raw", "image", "video"]
+                            # Try multiple resource_types in order to avoid 401 for mismatched types
+                            from cloudinary.utils import cloudinary_url  # type: ignore
+                            for rt in rt_order:
+                                try:
+                                    url_candidate, _opts = cloudinary_url(
+                                        upload.storage_key,
+                                        resource_type=rt,
+                                        secure=True,
+                                        sign_url=True,
+                                        auth_token={"duration": 300},
+                                    )
+                                    async with httpx.AsyncClient(timeout=60) as client:
+                                        r = await client.get(url_candidate)
+                                        if r.status_code < 400:
+                                            signed_url = url_candidate
+                                            file_bytes = r.content
+                                            break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        # Cloudinary lib or type check failed; fall back below
+                        pass
+                    if not cloud_attempted or not signed_url:
+                        # Fallback to repository-provided URL or basic get_file_url
+                        try:
+                            signed_url = await self.project_repository.file_storage.get_file_url(upload.storage_key, expires_in=300)
+                        except Exception:
+                            signed_url = (upload.url or "").strip()
+                        if not signed_url:
+                            raise RuntimeError("missing_file_url")
+                        async with httpx.AsyncClient(timeout=60) as client:
+                            r = await client.get(signed_url)
+                            r.raise_for_status()
+                            file_bytes = r.content
 
             # Convert to text
             text: str = ""

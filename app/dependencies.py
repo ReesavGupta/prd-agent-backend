@@ -5,6 +5,7 @@ Dependency injection setup for the application.
 from functools import lru_cache
 from app.db.database import get_database
 from app.repositories.cloudinary_storage import CloudinaryStorageRepository
+from app.repositories.local_storage import LocalStorageRepository
 from app.repositories.redis_cache import RedisCacheRepository
 from app.repositories.project import ProjectRepository
 from app.services.project_service import ProjectService
@@ -16,11 +17,21 @@ _cache_repository = None
 
 
 @lru_cache()
-def get_storage_repository() -> CloudinaryStorageRepository:
-    """Get file storage repository instance."""
+def get_storage_repository():
+    """Get file storage repository instance.
+
+    Chooses Cloudinary when credentials are configured; otherwise falls back to
+    LocalStorageRepository for development to avoid 500s on upload.
+    """
     global _storage_repository
-    if _storage_repository is None:
+    if _storage_repository is not None:
+        return _storage_repository
+    from app.core.config import settings
+    have_cloudinary = bool(settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET)
+    if have_cloudinary and not settings.USE_LOCAL_STORAGE:
         _storage_repository = CloudinaryStorageRepository()
+    else:
+        _storage_repository = LocalStorageRepository()
     return _storage_repository
 
 

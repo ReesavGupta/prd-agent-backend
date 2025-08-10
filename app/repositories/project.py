@@ -307,7 +307,7 @@ class ProjectRepository:
             "file_size": len(file_content),
             "content_type": content_type,
             "storage_key": upload_result["storage_key"],
-            "url": upload_result["url"],  # secure URL returned by Cloudinary
+            "url": upload_result.get("url"),  # may be file:/// URL in local storage
             "file_hash": file_hash,
             "indexed": False,
             "index_error": None,

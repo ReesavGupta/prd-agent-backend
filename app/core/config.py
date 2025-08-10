@@ -44,11 +44,16 @@ class Settings(BaseSettings):
     CACHE_TTL: int = 3600  # 1 hour default cache TTL
     
     # Cloudinary settings
-    CLOUDINARY_CLOUD_NAME: str = ""
-    CLOUDINARY_API_KEY: str = ""
-    CLOUDINARY_API_SECRET: str = ""
-    CLOUDINARY_FOLDER_PREFIX: str = "ai-prd-generator"
-    CLOUDINARY_SECURE_URL: bool = True
+    CLOUDINARY_CLOUD_NAME: str = os.getenv("CLOUDINARY_CLOUD_NAME")
+    CLOUDINARY_API_KEY: str = os.getenv("CLOUDINARY_API_KEY")
+    CLOUDINARY_API_SECRET: str = os.getenv("CLOUDINARY_API_SECRET")
+    CLOUDINARY_FOLDER_PREFIX: str = os.getenv("CLOUDINARY_FOLDER_PREFIX")
+    CLOUDINARY_SECURE_URL: bool = os.getenv("CLOUDINARY_SECURE_URL")
+
+    # Development fallback: use local storage when Cloudinary not configured
+    # USE_LOCAL_STORAGE: bool = bool(os.getenv("USE_LOCAL_STORAGE", "").lower() in ("1", "true", "yes"))
+    USE_LOCAL_STORAGE: bool = False
+    LOCAL_STORAGE_DIR: str = os.getenv("LOCAL_STORAGE_DIR", "./.local_storage")
     
     # CORS settings
     ALLOWED_ORIGINS: List[str] = [
@@ -103,6 +108,10 @@ class Settings(BaseSettings):
     # HITL Interrupt/Reminder configuration
     HITL_INTERRUPT_REMINDER_SECONDS: int = int(os.getenv("HITL_INTERRUPT_REMINDER_SECONDS", "120"))
     HITL_INTERRUPT_MAX_REMINDERS: int = int(os.getenv("HITL_INTERRUPT_MAX_REMINDERS", "1"))
+
+    # Chat-mode RAG defaults
+    CHAT_RAG_DEFAULT_SCOPE: str = os.getenv("CHAT_RAG_DEFAULT_SCOPE", "project")  # 'project' or 'single_file'
+    CHAT_RAG_MAX_K: int = int(os.getenv("CHAT_RAG_MAX_K", "6"))
     
     # Logging settings
     LOG_LEVEL: str = "INFO"

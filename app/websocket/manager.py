@@ -509,6 +509,37 @@ class WebSocketManager:
                 context_blocks.append(f"PRD Sections:\n{prd_section_spotlights}")
             if retrieved_text:
                 context_blocks.append(f"Document Snippets:\n{retrieved_text}")
+
+            # Project-wide fallback retrieval (chat-id scoped default) if no single-file provided
+            # and feature flag requests broader retrieval
+            try:
+                if not attachment_file_id and settings.CHAT_RAG_DEFAULT_SCOPE.lower() == "project":
+                    from bson import ObjectId
+                    db = get_database()
+                    has_indexed = await db.uploads.count_documents({"project_id": ObjectId(project_id), "indexed": True}) > 0
+                    if has_indexed:
+                        try:
+                            from app.services.rag_service import rag_service
+                            # Use configured top_k if available
+                            top_k = getattr(getattr(rag_service, "config", None), "top_k", settings.CHAT_RAG_MAX_K)
+                            store = rag_service._vector(namespace=str(project_id))
+                            docs = await store.asimilarity_search(content, k=top_k)
+                            combined = []
+                            total_chars = 0
+                            for d in docs or []:
+                                t = (getattr(d, 'page_content', '') or '').strip()
+                                if not t:
+                                    continue
+                                if total_chars + len(t) > 4500:
+                                    break
+                                combined.append(t)
+                                total_chars += len(t)
+                            if combined:
+                                context_blocks.append("Document Snippets:\n" + "\n\n".join(combined))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             context_str = "\n\n".join(context_blocks) if context_blocks else "(no context)"
 
             system_msg = {
