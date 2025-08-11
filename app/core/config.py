@@ -62,6 +62,7 @@ class Settings(BaseSettings):
         "http://localhost:8080",
         "http://127.0.0.1:8080",
         "http://0.0.0.0:8080",
+        "https://think-prd-frontend.vercel.app/"
     ]
     ALLOWED_METHODS: List[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     ALLOWED_HEADERS: List[str] = ["*"]
