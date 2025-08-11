@@ -1,5 +1,5 @@
 # Authentication API
-
+Latest backend workflow is documented in the repo root at ../Latest-project-workflow.md.
 A comprehensive user authentication system built with FastAPI and MongoDB, featuring JWT tokens, password hashing, rate limiting, and role-based access control foundations.
 
 ## Features

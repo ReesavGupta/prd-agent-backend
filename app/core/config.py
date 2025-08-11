@@ -112,6 +112,11 @@ class Settings(BaseSettings):
     # Chat-mode RAG defaults
     CHAT_RAG_DEFAULT_SCOPE: str = os.getenv("CHAT_RAG_DEFAULT_SCOPE", "project")  # 'project' or 'single_file'
     CHAT_RAG_MAX_K: int = int(os.getenv("CHAT_RAG_MAX_K", "6"))
+    # Agent-mode RAG controls
+    AGENT_RAG_ENABLED: bool = bool(os.getenv("AGENT_RAG_ENABLED", "true").lower() in ("1", "true", "yes"))
+    AGENT_RAG_DEFAULT_SCOPE: str = os.getenv("AGENT_RAG_DEFAULT_SCOPE", "project")  # 'project' or 'none'
+    AGENT_RAG_MAX_K: int = int(os.getenv("AGENT_RAG_MAX_K", "6"))
+    AGENT_RAG_MAX_CONTEXT_CHARS: int = int(os.getenv("AGENT_RAG_MAX_CONTEXT_CHARS", "4500"))
     
     # Logging settings
     LOG_LEVEL: str = "INFO"

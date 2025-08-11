@@ -79,4 +79,6 @@ class AgentState(BaseModel):
     send_event: Optional[Callable[[Dict[str, Any]], Any]] = Field(default=None, exclude=True)
     # Minimal identifiers for nodes to publish via manager when callback is absent
     ws_chat_id: Optional[str] = Field(default=None, exclude=True)
+    # Optional single-file attachment to bias RAG in agent mode (carried over a single resume/incorporation cycle)
+    pending_attachment_file_id: Optional[str] = None
 

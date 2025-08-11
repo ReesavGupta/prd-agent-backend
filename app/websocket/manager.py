@@ -610,7 +610,15 @@ class WebSocketManager:
                     "type": "agent_interrupt_cleared",
                     "data": {"question_id": answer.get("question_id")}
                 })
-                await resume_run(chat_id, {"type": "answer", "question_id": answer.get("question_id"), "text": answer.get("text", "")})
+                resume_payload = {"type": "answer", "question_id": answer.get("question_id"), "text": answer.get("text", "")}
+                # Optional pass-through of attachment_file_id to enable agent-mode RAG
+                try:
+                    attach = payload.get("attachment_file_id")
+                    if isinstance(attach, str) and attach.strip():
+                        resume_payload["attachment_file_id"] = attach.strip()
+                except Exception:
+                    pass
+                await resume_run(chat_id, resume_payload)
             elif "accept" in payload:
                 accept = payload["accept"] or {}
                 if not isinstance(accept, dict) or not accept.get("question_id"):
@@ -620,7 +628,14 @@ class WebSocketManager:
                     "type": "agent_interrupt_cleared",
                     "data": {"question_id": accept.get("question_id")}
                 })
-                await resume_run(chat_id, {"type": "accept", "question_id": accept.get("question_id"), "finish": bool(accept.get("finish"))})
+                resume_payload = {"type": "accept", "question_id": accept.get("question_id"), "finish": bool(accept.get("finish"))}
+                try:
+                    attach = payload.get("attachment_file_id")
+                    if isinstance(attach, str) and attach.strip():
+                        resume_payload["attachment_file_id"] = attach.strip()
+                except Exception:
+                    pass
+                await resume_run(chat_id, resume_payload)
             else:
                 await self._send_error(websocket, "Invalid resume payload: expected 'answer' or 'accept'")
         except Exception as e:

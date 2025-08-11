@@ -7,6 +7,7 @@ import logging
 import re
 import json
 from app.services.ai_service import ai_service
+from app.services.rag_service import build_agent_rag_context
 from app.agent.commands import detect_rename_title, apply_prd_title_rename
 from app.agent.intent import classify_intent, verify_is_answer
 from functools import lru_cache
@@ -899,6 +900,14 @@ async def await_human_answer(state: AgentState) -> AgentState:
         pass
 
     response = interrupt(payload)
+    # Capture optional attachment_file_id to bias agent-mode RAG on the next step
+    try:
+        if isinstance(response, dict):
+            attach = response.get("attachment_file_id")
+            if isinstance(attach, str) and attach.strip():
+                state.pending_attachment_file_id = attach.strip()
+    except Exception:
+        pass
     # Expected resume shapes (extended):
     # - {"type": "answer", "question_id": str, "text": str}
     # - {"type": "accept", "finish"?: bool}
@@ -984,6 +993,13 @@ async def await_human_answer(state: AgentState) -> AgentState:
         # Keep looping interrupts until we either collect an answer or the user declines
         current = response
         while isinstance(current, dict) and current.get("type") == "message":
+            # Capture optional attachment id if provided by client during resume messages
+            try:
+                attach = current.get("attachment_file_id")
+                if isinstance(attach, str) and attach.strip():
+                    state.pending_attachment_file_id = attach.strip()
+            except Exception:
+                pass
             user_text = str(current.get("text") or "").strip()
             state.last_user_message = user_text
             sec = state.pending_question.get("section") if state.pending_question else (state.last_section_target or "")
@@ -1313,10 +1329,43 @@ async def await_human_answer(state: AgentState) -> AgentState:
 
             # Generic: answer briefly, then request permission to proceed
             if state.ws_chat_id and user_text:
-                sys = {"role": "system", "content": "Answer the user's question briefly and helpfully in one sentence."}
-                usr = {"role": "user", "content": user_text}
+                # Build agent-mode RAG context similar to chat mode
                 try:
-                    resp = await ai_service.generate_response(user_id=state.user_id, messages=[sys, usr], temperature=0.2, max_tokens=120)
+                    ctx = await build_agent_rag_context(
+                        project_id=state.project_id,
+                        user_id=state.user_id,
+                        question=user_text,
+                        prd_markdown=state.prd_markdown,
+                        attachment_file_id=state.pending_attachment_file_id,
+                    )
+                except Exception:
+                    ctx = ""
+                sys = {
+                    "role": "system",
+                    "content": (
+                        "You are a concise product assistant. Use ONLY the provided context to answer the user's question. "
+                        "If the answer is not present, say you don't have enough information. Keep answers brief and specific."
+                    ),
+                }
+                usr = {"role": "user", "content": f"Context:\n{ctx or '(no context)'}\n\nQuestion:\n{user_text}"}
+                try:
+                    # Log state snapshot and question for observability
+                    try:
+                        logging.getLogger(__name__).info(
+                            "[AGENT_RAG] generic_reply qlen=%d attach=%s state_snapshot=%s",
+                            len(user_text or ""),
+                            (state.pending_attachment_file_id[:8] + '…') if state.pending_attachment_file_id else None,
+                            json.dumps({
+                                "project_id": state.project_id,
+                                "chat_id": state.chat_id,
+                                "user_id": state.user_id,
+                                "pending_question": bool(state.pending_question),
+                                "last_section_qid": state.last_section_qid,
+                            }, default=str)[:500]
+                        )
+                    except Exception:
+                        pass
+                    resp = await ai_service.generate_response(user_id=state.user_id, messages=[sys, usr], temperature=0.2, max_tokens=4000)
                     brief = (resp.content or "").strip()
                 except Exception:
                     brief = "Got it."
@@ -1412,12 +1461,42 @@ async def incorporate_answer(state: AgentState) -> AgentState:
             "- Do NOT add any extra commentary."
         ),
     }
+    # Build a compact RAG context to improve factual grounding for this section
+    try:
+        rag_ctx = await build_agent_rag_context(
+            project_id=state.project_id,
+            user_id=state.user_id,
+            question=(latest_one.get('question','') or target_section),
+            prd_markdown=state.prd_markdown,
+            attachment_file_id=state.pending_attachment_file_id,
+        )
+        try:
+            logging.getLogger(__name__).info(
+                "[AGENT_RAG] incorporate_answer context_len=%d section=%s attach=%s state_snapshot=%s",
+                len(rag_ctx or ""),
+                target_section,
+                (state.pending_attachment_file_id[:8] + '…') if state.pending_attachment_file_id else None,
+                json.dumps({
+                    "project_id": state.project_id,
+                    "chat_id": state.chat_id,
+                    "user_id": state.user_id,
+                    "last_section_qid": state.last_section_qid,
+                    "pending_question": bool(state.pending_question),
+                    "answered_qa_len": len(state.answered_qa or []),
+                }, default=str)[:500]
+            )
+        except Exception:
+            pass
+    except Exception:
+        rag_ctx = ""
+
     user_msg = {
         "role": "user",
         "content": (
             f"Current PRD (full):\n{state.prd_markdown}\n\n"
             f"Target section: {target_section}\n"
             f"Answer: {latest_one.get('answer','')}\n"
+            + (f"\nContext (do not copy; use for facts only):\n{rag_ctx}\n" if rag_ctx else "")
         ),
     }
     # 1) Update PRD deterministically: ask model for BODY ONLY, then splice into PRD
@@ -1450,6 +1529,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
         "content": (
             "You update PRDs. Output ONLY the Markdown BODY for the specified section. "
             "NO headings, NO backticks, NO preface/postface. "
+            "Use the provided CONTEXT strictly for factual grounding. Do NOT invent facts. If a fact is not supported by the context or the PRD, omit it. "
             "Do not copy the user's words verbatim; rewrite professionally and concretely. "
             "Keep it concise."
         ),
@@ -1461,6 +1541,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
             f"Style rules: {style_hints.get(target_section, 'Keep it concise and structured with short paragraphs or bullets.')}\n\n"
             f"Existing body (may be empty):\n{existing_body}\n\n"
             f"User answer (source to interpret/rewrite, not to copy):\n{latest_one.get('answer','')}\n"
+            + (f"\nContext from PRD summary / retrieved docs (do not copy verbatim; use only for facts):\n{rag_ctx}\n" if rag_ctx else "")
         ),
     }
 
@@ -1501,6 +1582,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
                         f"Section: {target_section}\n"
                         f"Style rules: {style_hints.get(target_section, '')}\n\n"
                         f"Draft body to improve:\n{body_text or existing_body}\n"
+                        + (f"\nContext (facts only):\n{rag_ctx}\n" if rag_ctx else "")
                     ),
                 }
                 resp2 = await ai_service.generate_response(
@@ -1544,6 +1626,11 @@ async def incorporate_answer(state: AgentState) -> AgentState:
         state.prd_markdown = _replace_section_body(state.prd_markdown, target_section, section_body)
     except Exception:
         # On error, leave PRD unchanged
+        pass
+    # Clear one-time attachment bias after use
+    try:
+        state.pending_attachment_file_id = None
+    except Exception:
         pass
     # Recompute section status
     order = state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []

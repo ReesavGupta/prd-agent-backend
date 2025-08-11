@@ -147,6 +147,111 @@ async def select_sections(prd_markdown: str, question: str, user_id: str) -> str
     return ""
 
 
+async def build_agent_rag_context(
+    *,
+    project_id: str,
+    user_id: str,
+    question: str,
+    prd_markdown: Optional[str] = None,
+    attachment_file_id: Optional[str] = None,
+) -> str:
+    """Build a compact RAG context string for agent mode, mirroring chat-mode behavior.
+
+    Order:
+    1) PRD summary (persisted or ephemeral from provided prd_markdown)
+    2) If attachment_file_id provided and indexed, retrieve top chunks for that file
+    3) Else, if AGENT_RAG_DEFAULT_SCOPE=project and there are any indexed uploads, add project-wide snippets
+    Caps the total context length to settings.AGENT_RAG_MAX_CONTEXT_CHARS.
+    Returns a single string suitable for inclusion in prompts.
+    """
+    if not settings.AGENT_RAG_ENABLED:
+        return ""
+
+    blocks: list[str] = []
+    try:
+        logger.info(
+            "[AGENT_RAG] build_context start project=%s user=%s attach=%s qlen=%d",
+            project_id,
+            user_id,
+            (attachment_file_id[:8] + '…') if attachment_file_id else None,
+            len(question or ""),
+        )
+    except Exception:
+        pass
+
+    # 1) PRD summary
+    try:
+        summary_text = await get_prd_summary(project_id=project_id, user_id=user_id, prd_markdown=prd_markdown)
+        if summary_text:
+            blocks.append("PRD Summary:\n" + summary_text.strip())
+            try:
+                logger.info("[AGENT_RAG] prd_summary len=%d sample=%r", len(summary_text), (summary_text or "")[:200])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2) Single-file retrieval if attachment id provided (prefer single-file over project-wide)
+    added_project_scope = False
+    if attachment_file_id:
+        try:
+            snippet = await retrieve_attachment(project_id=project_id, file_id=attachment_file_id, query=question)
+            if snippet:
+                blocks.append("Document Snippets:\n" + snippet.strip())
+                added_project_scope = True
+                try:
+                    logger.info("[AGENT_RAG] single_file retrieve file_id=%s len=%d sample=%r", attachment_file_id, len(snippet), (snippet or "")[:200])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 3) Optional project-wide retrieval
+    if (settings.AGENT_RAG_DEFAULT_SCOPE.lower() == "project"):
+        try:
+            from bson import ObjectId
+            from app.db.database import get_database
+            db = get_database()
+            has_indexed = await db.uploads.count_documents({"project_id": ObjectId(project_id), "indexed": True}) > 0
+            if has_indexed:
+                try:
+                    from app.services.rag_service import rag_service
+                    top_k = getattr(getattr(rag_service, "config", None), "top_k", settings.AGENT_RAG_MAX_K)
+                    store = rag_service._vector(namespace=str(project_id))
+                    docs = await store.asimilarity_search(question, k=top_k)
+                    combined = []
+                    total_chars = 0
+                    for d in docs or []:
+                        t = (getattr(d, 'page_content', '') or '').strip()
+                        if not t:
+                            continue
+                        if total_chars + len(t) > settings.AGENT_RAG_MAX_CONTEXT_CHARS:
+                            break
+                        combined.append(t)
+                        total_chars += len(t)
+                    if combined:
+                        blocks.append("Document Snippets:\n" + "\n\n".join(combined))
+                        try:
+                            logger.info("[AGENT_RAG] project_wide retrieve k=%d blocks=%d total_chars=%d sample=%r", len(docs or []), len(combined), sum(len(x) for x in combined), ("\n\n".join(combined) or "")[:200])
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Compact and cap by chars
+    out = "\n\n".join(blocks).strip()
+    cap = max(1000, int(settings.AGENT_RAG_MAX_CONTEXT_CHARS))
+    if len(out) > cap:
+        out = out[:cap]
+    try:
+        logger.info("[AGENT_RAG] build_context done total_len=%d sample=%r", len(out), out[:300])
+    except Exception:
+        pass
+    return out
+
+
 async def retrieve_attachment(project_id: str, file_id: str, query: str) -> str:
     """Retrieve top chunks from Pinecone for the given file_id within the project namespace.
     Returns concatenated text (~<=4500 chars). Uses the same embedding/vector configuration as indexing.
