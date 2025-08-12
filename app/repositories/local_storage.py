@@ -84,6 +84,29 @@ class LocalStorageRepository(FileStorageRepository):
         normalized = abs_path.replace("\\", "/")
         return f"file:///{normalized}"
 
+    async def download_file(self, filename: str, folder_path: str) -> bytes | None:
+        """Download file content from local storage."""
+        try:
+            # Build the path to find the file
+            base_dir = os.path.join(self.root, folder_path)
+            if not os.path.isdir(base_dir):
+                return None
+                
+            # Look for files that match the filename pattern
+            # Since files are stored with hash prefixes, we need to find the actual file
+            name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+            
+            for file in os.listdir(base_dir):
+                if file.startswith(name_without_ext) or file == filename:
+                    file_path = os.path.join(base_dir, file)
+                    if os.path.isfile(file_path):
+                        with open(file_path, 'rb') as f:
+                            return f.read()
+            
+            return None
+        except Exception:
+            return None
+
     async def copy_file(self, source_key: str, destination_key: str) -> bool:
         try:
             src = self._abs_path_for(source_key)

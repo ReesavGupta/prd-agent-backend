@@ -186,6 +186,33 @@ async def get_project(
         )
 
 
+@router.get("/{project_id}/current-artifacts", status_code=status.HTTP_200_OK)
+async def get_current_artifacts(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    project_service: ProjectService = Depends(get_project_service)
+):
+    """Get current PRD and flowchart artifacts for a project."""
+    try:
+        artifacts = await project_service.get_current_artifacts(
+            project_id=project_id,
+            user_id=str(current_user.id)
+        )
+        
+        return BaseResponse.success(
+            data=artifacts,
+            message="Current artifacts retrieved successfully"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get current artifacts: {str(e)}"
+        )
+
+
 @router.put("/{project_id}", response_model=ProjectResponse)
 async def update_project(
     project_id: str,
