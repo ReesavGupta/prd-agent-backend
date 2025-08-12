@@ -89,7 +89,11 @@ def _parse_sections_from_markdown(md: str) -> List[Tuple[str, int, int]]:
             # close previous
             if current_head is not None and current_start is not None:
                 sections.append((current_head, current_start, i))
-            current_head = line.strip().lstrip("# ")
+            # keep heading raw text only (no inline descriptions after ':')
+            raw = line.strip().lstrip("# ")
+            if ':' in raw:
+                raw = raw.split(':', 1)[0]
+            current_head = raw
             current_start = i + 1
     if current_head is not None and current_start is not None:
         sections.append((current_head, current_start, len(lines)))
@@ -125,23 +129,31 @@ def _canonicalize_heading_key(text: str) -> str:
     return t.strip().lower()
 
 
-def _compute_sections_status(prd_markdown: str, target_order: List[str]) -> Dict[str, bool]:
+def _compute_sections_statuses(prd_markdown: str, target_order: List[str]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
     sections = _parse_sections_from_markdown(prd_markdown)
     # Build map: normalized section key -> content length
     content_by_key: Dict[str, int] = {}
     lines = (prd_markdown or "").splitlines()
     for head, s, e in sections:
-        # Remove the heading line content from body length
         body = "\n".join(lines[s:e]).strip()
         key = _canonicalize_heading_key(head)
         content_by_key[key] = len(body)
-    result: Dict[str, bool] = {}
+
+    # Template-only status
+    by_template: Dict[str, bool] = {}
     for sec in target_order:
         key = _canonicalize_heading_key(sec)
         length = content_by_key.get(key, 0)
-        # Consider a section complete if it has >= 60 non-whitespace chars
-        result[sec] = bool(length >= 60)
-    return result
+        by_template[sec] = bool(length >= 120)
+
+    # All parsed headings status
+    all_status: Dict[str, bool] = {}
+    for head, _s, _e in sections:
+        key = _canonicalize_heading_key(head)
+        length = content_by_key.get(key, 0)
+        all_status[head] = bool(length >= 120)
+
+    return by_template, all_status
 
 
 def _find_section_range(prd_markdown: str, target_section: str) -> Tuple[int, int, List[str], str]:
@@ -270,64 +282,89 @@ def _domain_hints(domain_slug: str) -> str:
 
 def _domain_specific_fallback_question(section: str, domain_slug: str) -> str:
     s = _canonicalize_heading_key(section)
-    if domain_slug == "ai_coding_assistant":
-        if s.startswith("1. "):
-            return "Which developer workflows will v1 focus on (e.g., inline completions, refactor, chat in editor)?"
-        if s.startswith("2. "):
-            return "What 2–3 measurable v1 targets will we hit (e.g., p95 latency ≤ 200ms, ≥ 60% suggestion acceptance)?"
-        if s.startswith("3. "):
-            return "Which roles/editors are in scope first (e.g., JS full‑stack in VS Code, Python ML in JetBrains)?"
-        if s.startswith("4. "):
-            return "What top pain points in the coding flow must v1 solve (e.g., context hopping, test scaffolding)?"
-        if s.startswith("5. "):
-            return "Which must‑have v1 features and language/editor scope are required to deliver value?"
-        if s.startswith("6. "):
-            return "What latency, privacy, and enterprise constraints must v1 meet (p95 targets, data boundaries)?"
-        if s.startswith("7. "):
-            return "What is the happy‑path from writing code to applying suggestions and verifying changes?"
-        if s.startswith("8. "):
-            return "Which context sources, model family, and indexing approach will we use (repo size, monorepos)?"
-        if s.startswith("11. "):
-            return "Which success metrics matter most (suggestion acceptance, task time saved, p95 latency, crash‑free %)?"
-        if s.startswith("12. "):
-            return "What release criteria must v1 pass (supported languages/editors, p95 latency, reliability)?"
-    if domain_slug == "fitness_tracker":
-        if s.startswith("1. "):
-            return "Which primary use case will v1 target (weight loss, cardio, strength) and on which platforms?"
-        if s.startswith("2. "):
-            return "What 2–3 measurable v1 goals will we track (DAU, day‑7 retention, goal adherence)?"
-        if s.startswith("3. "):
-            return "Who are the first personas (e.g., beginners, busy professionals) and their key constraints?"
-        if s.startswith("5. "):
-            return "Which must‑have v1 features deliver value (activity tracking, goals, reminders, social)?"
-        if s.startswith("6. "):
-            return "What NFRs matter most (battery life, data privacy, sync reliability)?"
-        if s.startswith("8. "):
-            return "Which sensors and integrations are needed (Apple Health/Google Fit), and what tech stack?"
-        if s.startswith("11. "):
-            return "Which metrics define success (active days/week, goal adherence, retention)?"
-    # General fallback by lens
-    lens = _section_to_lens(section)
-    if lens == "metrics" and s.startswith("2. "):
-        return "What 2–3 measurable v1 targets will define success (include numeric thresholds and timeframe)?"
-    if lens == "user_journey" and s.startswith("5. "):
-        return "Which 5–8 core features are essential for v1 and why?"
-    if lens == "discovery" and s.startswith("1. "):
-        return "What core value does the product deliver and who is the primary user?"
-    return f"{section}: what specific details should we capture here?"
+    # Disabled domain-specific canned fallbacks to prioritize idea-specific tailoring
+    # Return empty string to signal no domain fallback should be used
+    return ""
+
+def _extract_idea_terms(idea_text: str, max_terms: int = 6) -> List[str]:
+    """Extract salient terms from the idea to bias questions and generations.
+
+    Simple heuristic: tokenize, lowercase, drop short/stop words, preserve order of first appearance.
+    """
+    if not idea_text:
+        return []
+    import re as _re
+    tokens = [t for t in _re.split(r"[^\w]+", idea_text.lower()) if t]
+    stop = {
+        "the","a","an","and","or","to","of","in","for","on","with","your","our","app","product","project","build","create","make","v1","first","users","user","ai","ml","app","service","platform","tool","system"
+    }
+    terms: List[str] = []
+    seen: set[str] = set()
+    for t in tokens:
+        if len(t) < 4 or t in stop:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        terms.append(t)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
+def _is_valid_question(text: str) -> bool:
+    """Validate a question string against basic quality and anti-generic rules."""
+    t = (text or "").strip()
+    if not t or t == "?":
+        return False
+    if not any(ch.isalpha() for ch in t):
+        return False
+    if len(t) < 10:
+        return False
+    tl = t.lower()
+    banned = (
+        "what is the main",
+        "which features",
+        "what 2–3",
+        "what 2-3",
+        "what are the 2",
+        "what is the happy-path",
+        "what primary success metrics",
+        "what core value does the product",
+    )
+    if any(b in tl for b in banned):
+        return False
+    return True
+
+
+def _dedup_plan_items(plan: Optional[List[Dict[str, str]]]) -> List[Dict[str, str]]:
+    """Remove duplicate plan items by canonical section key, preserving order."""
+    if not isinstance(plan, list):
+        return []
+    seen: set[str] = set()
+    result: List[Dict[str, str]] = []
+    for item in plan:
+        sec = (item.get("section") or "").strip()
+        key = _canonicalize_heading_key(sec)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
 
 def _system_prompt_initial_outline(template_text: str, title: str) -> str:
-    """Prompt the model to output ONLY the outline based on the canonical template."""
+    """Prompt the model to output a dynamic outline with idea-specific one-liners per section."""
     return (
         "You are a product manager generating an initial PRD outline.\n"
         "Rules:\n"
         "- Begin with exactly one H1 line: '# Product Requirement Document: "
         + title.replace("\n", " ").strip()
         + "'\n"
-        "- Then output the sections exactly as in the template below.\n"
-        "- Do NOT add any commentary before or after.\n"
-        "- Do NOT include code fences.\n\n"
-        "Template (copy sections and headings verbatim; it's okay if bodies are empty initially):\n\n"
+        "- Then output ALL sections exactly as in the template below (keep headings verbatim and in order).\n"
+        "- Under EACH section, write 1 short, idea-tailored line grounded ONLY in the user's one‑liner (do not invent specifics).\n"
+        "- Keep each line crisp (<= 20 words) and relevant to the idea; if unknown, write 'TBD — based on idea'.\n"
+        "- No code fences. No preface. No postface.\n\n"
+        "Template (use these headings verbatim; add the one-liner beneath each):\n\n"
         + template_text
     )
 
@@ -397,9 +434,10 @@ async def generate_prd(state: AgentState) -> AgentState:
                 idx = combined.find("# Product Requirement Document:")
                 prd_accum = combined[idx:]
                 # Stop chat streaming from now on; start editor updates immediately
+                # Initial outline draft preview (with one-liners). Do NOT mark sections complete yet.
                 await _emit({
                     "type": "artifacts_preview",
-                    "data": {"prd_markdown": prd_accum, "mermaid": None},
+                    "data": {"prd_markdown": prd_accum, "mermaid": None, "sections_status": {}},
                 })
                 last_emit_len = len(prd_accum)
             else:
@@ -412,10 +450,11 @@ async def generate_prd(state: AgentState) -> AgentState:
         else:
             prd_accum += delta
             # Throttle: emit only if significant growth
-            if len(prd_accum) - last_emit_len >= 80:
+            # emit more frequently for responsive editor updates
+            if len(prd_accum) - last_emit_len >= 40:
                 await _emit({
                     "type": "artifacts_preview",
-                    "data": {"prd_markdown": prd_accum, "mermaid": None},
+                    "data": {"prd_markdown": prd_accum, "mermaid": None, "sections_status": {}},
                 })
                 last_emit_len = len(prd_accum)
 
@@ -423,8 +462,9 @@ async def generate_prd(state: AgentState) -> AgentState:
     state.prd_markdown = prd_accum
     # Emit final artifacts + sections status
     sections_order = state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []
-    sec_status = _compute_sections_status(state.prd_markdown, sections_order)
+    sec_status, all_status = _compute_sections_statuses(state.prd_markdown, sections_order)
     state.sections_status = sec_status
+    state.all_sections_status = all_status
     await _emit({
         "type": "artifacts_preview",
         "data": {
@@ -681,8 +721,9 @@ def analyze_gaps(state: AgentState) -> AgentState:
     sections_order: List[str] = state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []
     max_q = int(state.completion_targets.get("max_questions", 14)) if isinstance(state.completion_targets, dict) else 14
 
-    sec_status = _compute_sections_status(full_text, sections_order)
+    sec_status, all_status = _compute_sections_statuses(full_text, sections_order)
     state.sections_status = sec_status
+    state.all_sections_status = all_status
     sections_ok = all(sec_status.values()) if sec_status else False
 
     forced_finish = bool((state.telemetry or {}).get("force_finish"))
@@ -692,18 +733,305 @@ def analyze_gaps(state: AgentState) -> AgentState:
     # Require at least min_q Q/A incorporations unless explicitly forced to finish
     should_finish = forced_finish or (sections_ok and have_min) or hit_limit
 
-    state.telemetry = {**(state.telemetry or {}), "sections_ok": sections_ok, "should_finish": should_finish}
+    # Update telemetry and record any user-added (extra) sections by canonical key
+    try:
+        template_keys = { _canonicalize_heading_key(s) for s in (state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []) }
+        all_keys = { _canonicalize_heading_key(h) for h in (state.all_sections_status or {}).keys() }
+        extra_keys = [k for k in all_keys if k and k not in template_keys]
+    except Exception:
+        extra_keys = []
+    state.telemetry = {
+        **(state.telemetry or {}),
+        "sections_ok": sections_ok,
+        "should_finish": should_finish,
+        "extra_section_keys": extra_keys,
+    }
+    return state
+async def propose_initial_questions(state: AgentState) -> AgentState:
+    """Build an initial one-question-per-section plan, emit it, and set the first pending question.
+
+    Strategy:
+    - Parse sections from the current outline PRD using the parser helpers.
+    - Ask the LLM for a strict JSON object mapping each section to one idea-tailored question.
+    - Validate/sanitize questions (must include idea keyword if available; ban generic patterns).
+    - Save plan in state.initial_question_plan and emit a WS event so the UI can render it.
+    - Select the earliest incomplete section and set it as pending.
+    """
+    from app.websocket.publisher import publish_to_chat
+
+    async def _emit(event: Dict[str, Any]) -> None:
+        if callable(state.send_event):
+            await state.send_event(event)  # type: ignore
+        elif getattr(state, "ws_chat_id", None):
+            await publish_to_chat(state.ws_chat_id, event)  # type: ignore
+
+    # Build plan strictly from canonical completion targets (8-section template)
+    target_sections: List[str] = []
+    try:
+        if isinstance(state.completion_targets, dict):
+            target_sections = list(state.completion_targets.get("sections", []))
+    except Exception:
+        target_sections = []
+    if not target_sections:
+        # Fallback: parse from current PRD
+        parsed = _parse_sections_from_markdown(state.prd_markdown)
+        target_sections = [head for head, _s, _e in parsed]
+    # Guard
+    if not target_sections:
+        state.initial_question_plan = []
+        state.plan_cursor = 0
+        return state
+
+    # Build JSON instruction
+    idea_text = (state.idea or "").strip()
+    terms = _extract_idea_terms(idea_text)
+    json_keys = [f"s{i+1}" for i in range(len(target_sections))]
+    mapping_example = ", ".join([f"\"{k}\":\"...\"" for k in json_keys])
+    sys = {
+        "role": "system",
+        "content": (
+            "Return ONE idea-tailored question per provided PRD section in STRICT minified JSON. "
+            "Rules: no preface; exactly 1 question per key; each must end with '?' and avoid generic phrasing. "
+            "Include at least one idea keyword if available."
+        ),
+    }
+    sec_lines = [f"- {i+1}. {t}" for i, t in enumerate(target_sections)]
+    usr_parts = [
+        (f"Idea: {idea_text}" if idea_text else "Idea: (none)"),
+        (f"Idea key phrases: {', '.join(terms)}" if terms else ""),
+        "Sections:",
+        "\n".join(sec_lines),
+        f"Output ONLY JSON: {{{mapping_example}}}",
+    ]
+    usr = {"role": "user", "content": "\n".join([p for p in usr_parts if p])}
+
+    questions_by_key: Dict[str, str] = {}
+    try:
+        resp = await ai_service.generate_response(
+            user_id=state.user_id,
+            messages=[sys, usr],
+            temperature=0.2,
+            max_tokens=400,
+            use_cache=False,
+        )
+        raw = (resp.content or "").strip()
+        try:
+            import json as _json
+            data = _json.loads(raw)
+        except Exception:
+            # allow code-fenced JSON
+            raw2 = raw.strip("`\n ")
+            import re as _re
+            if raw2.lower().startswith("json"):
+                raw2 = raw2[len("json"):].lstrip()
+            data = _json.loads(raw2)
+        if isinstance(data, dict):
+            for i, key in enumerate(json_keys):
+                q = str((data.get(key) or "")).strip()
+                if q:
+                    if not q.endswith("?"):
+                        q = q.rstrip(". ") + "?"
+                    questions_by_key[key] = q
+    except Exception:
+        questions_by_key = {}
+
+    # Fallback per-section if JSON failed or missing keys
+    if len(questions_by_key) < len(target_sections):
+        for i, title in enumerate(target_sections):
+            key = f"s{i+1}"
+            if key in questions_by_key and questions_by_key[key]:
+                continue
+            # reuse the same single-question generator prompt as in propose_next_question
+            try:
+                single_sys = {
+                    "role": "system",
+                    "content": (
+                        "Write ONE specific, concise, idea‑tailored question for the PRD section below. "
+                        "Avoid generic phrasing. ≤ 150 chars. End with '?'."
+                    ),
+                }
+                single_usr = {"role": "user", "content": f"Idea: {idea_text}\nSection: {title}\nKey phrases: {', '.join(terms)}"}
+                r = await ai_service.generate_response(
+                    user_id=state.user_id,
+                    messages=[single_sys, single_usr],
+                    temperature=0.2,
+                    max_tokens=120,
+                    use_cache=False,
+                )
+                q = (r.content or "").strip().strip("'\"")
+                if "\n" in q:
+                    q = next((ln.strip() for ln in q.splitlines() if ln.strip()), q)
+                if not q.endswith("?"):
+                    q = q.rstrip(". ") + "?"
+                questions_by_key[key] = q
+            except Exception:
+                questions_by_key[key] = f"For '{(idea_text or 'this product')}', what specific details should we include for {title}?"
+
+    # Sanitize with validators
+    plan: List[Dict[str, str]] = []
+    for i, title in enumerate(target_sections):
+        key = f"s{i+1}"
+        q = (questions_by_key.get(key) or "").strip()
+        if not _is_valid_question(q):
+            # synthesize with idea terms
+            t = ", ".join(terms[:2]) or title
+            idea_short = (idea_text or "this product").strip()
+            if len(idea_short) > 60:
+                idea_short = idea_short[:60].rstrip() + "…"
+            q = f"For '{idea_short}', what specific details about {t} should we include to complete the {title}?"
+            if not q.endswith("?"):
+                q = q.rstrip(". ") + "?"
+        plan.append({"id": f"sec_{i+1}", "section": title, "question": q})
+
+    state.initial_question_plan = _dedup_plan_items(plan)
+    state.plan_cursor = 0
+
+    # Emit the plan so the UI can render it
+    await _emit({"type": "agent_question_plan", "data": {"questions": plan}})
+
+    # Select earliest incomplete from plan
+    status = state.sections_status or {}
+    chosen = None
+    for item in plan:
+        if not bool(status.get(item["section"], False)):
+            chosen = item
+            break
+    if chosen is None and plan:
+        chosen = plan[0]
+
+    if chosen:
+        state.pending_question = {
+            "id": chosen["id"],
+            "question": chosen["question"],
+            "section": chosen["section"],
+            "rationale": f"Fill out the '{chosen['section']}' section with concrete details.",
+        }
+        state.pending_question_kind = "section"
+        state.last_section_target = chosen["section"]
+        state.last_section_question = chosen["question"]
+        state.last_section_qid = chosen["id"]
     return state
 
 
 async def propose_next_question(state: AgentState) -> AgentState:
-    """Select the earliest incomplete PRD section and ask a guided question with required phrasing."""
+    """Select the earliest incomplete PRD section and ask a guided question with required phrasing.
+
+    Also appends questions for user-added sections and emits a delta plan event when new items are added.
+    """
+    from app.websocket.publisher import publish_to_chat
+
+    async def _emit(event: Dict[str, Any]) -> None:
+        if callable(state.send_event):
+            await state.send_event(event)  # type: ignore
+        elif getattr(state, "ws_chat_id", None):
+            await publish_to_chat(state.ws_chat_id, event)  # type: ignore
     # If there is already a pending question (including a confirmation), do not propose a new one
     if state.pending_question:
         return state
     if (state.telemetry or {}).get("should_finish"):
         state.pending_question = None
         return state
+
+    # Prefer items from initial plan if present
+    if isinstance(state.initial_question_plan, list) and state.initial_question_plan:
+        status = state.sections_status or {}
+        for item in state.initial_question_plan:
+            secp = item.get("section") or ""
+            if not bool(status.get(secp)) and item.get("question") not in (state.asked_questions or []):
+                state.pending_question = {
+                    "id": item.get("id") or f"sec_{(state.initial_question_plan.index(item)+1)}",
+                    "question": item.get("question") or "",
+                    "section": secp,
+                    "rationale": f"Fill out the '{secp}' section with concrete details.",
+                }
+                state.pending_question_kind = "section"
+                state.last_section_target = secp
+                state.last_section_question = item.get("question") or ""
+                state.last_section_qid = state.pending_question.get("id")
+                return state
+
+    # If there are user-added extra sections not in template, append questions for them and pick the earliest
+    try:
+        extra_keys: List[str] = list((state.telemetry or {}).get("extra_section_keys") or [])
+    except Exception:
+        extra_keys = []
+    if extra_keys:
+        # Build a map from canonical key -> display heading using current PRD parse
+        parsed = _parse_sections_from_markdown(state.prd_markdown)
+        key_to_display: Dict[str, str] = {}
+        for head, _s, _e in parsed:
+            key_to_display[_canonicalize_heading_key(head)] = head
+        appended_any = False
+        appended_items: List[Dict[str, str]] = []
+        for k in extra_keys:
+            # Skip if already planned
+            if any(_canonicalize_heading_key(x.get("section","")) == k for x in (state.initial_question_plan or [])):
+                continue
+            display = key_to_display.get(k) or k
+            # Generate a single idea-tailored question for this new section
+            try:
+                idea_text = (state.idea or "").strip()
+                terms = _extract_idea_terms(idea_text)
+                single_sys = {"role": "system", "content": (
+                    "Write ONE specific, concise, idea‑tailored question for the PRD section below. "
+                    "Avoid generic phrasing. ≤ 150 chars. End with '?'."
+                )}
+                single_usr = {"role": "user", "content": f"Idea: {idea_text}\nSection: {display}\nKey phrases: {', '.join(terms)}"}
+                r = await ai_service.generate_response(
+                    user_id=state.user_id,
+                    messages=[single_sys, single_usr],
+                    temperature=0.2,
+                    max_tokens=120,
+                    use_cache=False,
+                )
+                q = (r.content or "").strip().strip("'\"")
+                if "\n" in q:
+                    q = next((ln.strip() for ln in q.splitlines() if ln.strip()), q)
+                if not q.endswith("?"):
+                    q = q.rstrip(". ") + "?"
+                if not _is_valid_question(q):
+                    idea_short = (idea_text or "this product").strip()
+                    if len(idea_short) > 60:
+                        idea_short = idea_short[:60].rstrip() + "…"
+                    t = ", ".join(terms[:2]) or display
+                    q = f"For '{idea_short}', what specific details about {t} should we include to complete the {display}?"
+                    if not q.endswith("?"):
+                        q = q.rstrip(". ") + "?"
+            except Exception:
+                q = f"What specific details should we include to complete the {display}?"
+            # Append to plan
+            if not isinstance(state.initial_question_plan, list):
+                state.initial_question_plan = []
+            new_item = {"id": f"extra:{k}", "section": display, "question": q}
+            # Append and de-duplicate by canonical key
+            state.initial_question_plan.append(new_item)
+            state.initial_question_plan = _dedup_plan_items(state.initial_question_plan)
+            # Record item actually present after de-dup
+            if any(_canonicalize_heading_key(it.get("section","")) == _canonicalize_heading_key(display) for it in state.initial_question_plan):
+                appended_items.append(new_item)
+            appended_any = True
+        # If we appended, try to pick the first extra section that is incomplete
+        if appended_any:
+            # Emit delta so FE can update plan view without reloading the full plan
+            try:
+                await _emit({"type": "agent_question_plan_delta", "data": {"questions": appended_items}})
+            except Exception:
+                pass
+            status_all = state.all_sections_status or {}
+            for item in state.initial_question_plan:
+                secd = item.get("section") or ""
+                if (secd in status_all and not bool(status_all.get(secd))) and item.get("question") not in (state.asked_questions or []):
+                    state.pending_question = {
+                        "id": item.get("id") or f"extra:{_canonicalize_heading_key(secd)}",
+                        "question": item.get("question") or "",
+                        "section": secd,
+                        "rationale": f"Fill out the '{secd}' section with concrete details.",
+                    }
+                    state.pending_question_kind = "section"
+                    state.last_section_target = secd
+                    state.last_section_question = item.get("question") or ""
+                    state.last_section_qid = state.pending_question.get("id")
+                    return state
 
     order: List[str] = state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []
     status = state.sections_status or {}
@@ -753,7 +1081,20 @@ async def propose_next_question(state: AgentState) -> AgentState:
         if not any(ch.isalpha() for ch in t):
             return False
         # minimal length to avoid trivial outputs
-        if len(t) < 12:
+        if len(t) < 10:
+            return False
+        tl = t.lower()
+        banned = (
+            "what is the main",
+            "which features",
+            "what 2–3",
+            "what 2-3",
+            "what are the 2",
+            "what is the happy-path",
+            "what primary success metrics",
+            "what core value does the product",
+        )
+        if any(b in tl for b in banned):
             return False
         return True
 
@@ -761,26 +1102,28 @@ async def propose_next_question(state: AgentState) -> AgentState:
         idea_short = (idea or "this product").strip()
         if len(idea_short) > 60:
             idea_short = idea_short[:60].rstrip() + "…"
-        # Domain- and lens-aware fallback
-        domain_slug, domain_label = _detect_domain(idea)
-        domain_q = _domain_specific_fallback_question(sec, domain_slug)
-        if domain_q and not domain_q.startswith(sec):
-            return domain_q
-        # Default tailored wrapper
-        return f"{sec}: For '{idea_short}', {generic}"
+        key_terms = _extract_idea_terms(idea)
+        if key_terms:
+            terms_text = ", ".join(key_terms[:3])
+            return f"For '{idea_short}' ({terms_text}), {generic}"
+        return f"For '{idea_short}', {generic}"
 
     specialized_q: Optional[str] = None
     try:
         sys = {
             "role": "system",
             "content": (
-                "Write ONE specific, concise question to elicit the most useful information to complete the given PRD section. "
-                "Tailor it to the product idea and current draft. Constraints: 1 question only; ≤ 160 chars; no preface, no numbering, no quotes; end with '?'."
+                "Write ONE specific, concise, idea-tailored question to complete the given PRD section. "
+                "Use the product one-liner and its key terms; avoid generic phrasing. Constraints: 1 question only; ≤ 160 chars; "
+                "no preface, no numbering, no quotes; end with '?' and include at least one idea keyword if available."
             ),
         }
         ctx_parts: List[str] = []
         if idea_text:
             ctx_parts.append(f"Idea: {idea_text}")
+            terms = _extract_idea_terms(idea_text)
+            if terms:
+                ctx_parts.append("Idea key phrases: " + ", ".join(terms))
         ctx_parts.append(f"Section: {target}")
         if existing_body:
             body_trim = existing_body.strip()
@@ -802,7 +1145,7 @@ async def propose_next_question(state: AgentState) -> AgentState:
             user_id=state.user_id,
             messages=[sys, usr],
             temperature=0.2,
-            max_tokens=80,
+            max_tokens=120,
             use_cache=False,
         )
         candidate = (resp.content or "").strip()
@@ -824,10 +1167,56 @@ async def propose_next_question(state: AgentState) -> AgentState:
     except Exception:
         specialized_q = None
 
+    # Second attempt with stricter prompt if first was invalid
+    def _contains_idea_term(q: str, idea: str) -> bool:
+        terms = _extract_idea_terms(idea)
+        if not terms:
+            return True  # no hard requirement if no terms extracted
+        ql = (q or "").lower()
+        return any(t in ql for t in terms)
+
+    if not specialized_q or not _contains_idea_term(specialized_q, idea_text):
+        try:
+            sys2 = {"role": "system", "content": (
+                "Output exactly ONE question customized to the product idea to complete the target PRD section. "
+                "Avoid generic phrases like 'what is the main' or 'which features'. Use one idea keyword. ≤ 150 chars. End with '?'."
+            )}
+            terms = _extract_idea_terms(idea_text)
+            usr2_ctx = [f"Idea: {idea_text}", f"Section: {target}"]
+            if terms:
+                usr2_ctx.append("Idea key phrases: " + ", ".join(terms))
+            usr2 = {"role": "user", "content": "\n".join(usr2_ctx)}
+            resp2 = await ai_service.generate_response(
+                user_id=state.user_id,
+                messages=[sys2, usr2],
+                temperature=0.2,
+                max_tokens=100,
+                use_cache=False,
+            )
+            c2 = (resp2.content or "").strip().strip('\"\'')
+            if "\n" in c2:
+                c2 = next((ln.strip() for ln in c2.splitlines() if ln.strip()), c2)
+            if not c2.endswith("?"):
+                c2 = c2.rstrip(". ") + "?"
+            specialized_q = c2 if (_is_valid_question(c2) and _contains_idea_term(c2, idea_text)) else None
+        except Exception:
+            specialized_q = None
+
     if specialized_q:
         phrased = specialized_q
     else:
-        phrased = _tailored_fallback(idea_text, target, base) if idea_text else f"{target}: {base}"
+        phrased = _tailored_fallback(idea_text, target, base) if idea_text else f"For '{(idea_text or 'this product').strip()}', {base}"
+
+    # Final guard: if phrased looks generic/invalid, synthesize a targeted variant using idea terms
+    if not _is_valid_question(phrased):
+        terms = _extract_idea_terms(idea_text)
+        focus = (", ".join(terms[:2]) or (target.split(":",1)[-1].strip() or "key details")).strip()
+        idea_short = (idea_text or "this product").strip()
+        if len(idea_short) > 60:
+            idea_short = idea_short[:60].rstrip() + "…"
+        phrased = f"For '{idea_short}', what specific details about {focus} should we include to complete the {target}?"
+        if not phrased.endswith("?"):
+            phrased = phrased.rstrip(". ") + "?"
     qid = f"sec_{order.index(target)+1}"
     state.pending_question = {
         "id": qid,
@@ -974,6 +1363,23 @@ async def await_human_answer(state: AgentState) -> AgentState:
                     await publish_to_chat(state.ws_chat_id, {"type": "agent_interrupt_cleared", "data": {"question_id": qid_clear}})
         except Exception:
             pass
+        # Respect user's choice: clear pending; DO NOT modify PRD. Reply briefly with current state and next steps.
+        try:
+            if state.ws_chat_id:
+                from app.websocket.publisher import publish_to_chat
+                ack_text = "Okay — I won't update the PRD without your answer. Ask anything or tell me when to continue."
+                await publish_to_chat(state.ws_chat_id, {
+                    "type": "message_sent",
+                    "data": {
+                        "message_id": f"a:{int(time.time()*1000)}",
+                        "user_id": state.user_id,
+                        "content": ack_text,
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "message_type": "assistant",
+                    },
+                })
+        except Exception:
+            pass
         state.pending_question = None
         state.pending_question_kind = None
         return state
@@ -1114,7 +1520,7 @@ async def await_human_answer(state: AgentState) -> AgentState:
                         "data": {
                             "message_id": f"a:{int(time.time()*1000)}",
                             "user_id": state.user_id,
-                            "content": "No problem — we can continue when you're ready.",
+                            "content": "No problem — I won't update the PRD without your answer. Ask anything or tell me when to continue.",
                             "timestamp": datetime.utcnow().isoformat() + "Z",
                             "message_type": "assistant",
                         },
@@ -1213,7 +1619,7 @@ async def await_human_answer(state: AgentState) -> AgentState:
                             "data": {
                                 "message_id": f"a:{int(time.time()*1000)}",
                                 "user_id": state.user_id,
-                                "content": "No problem — we can continue when you're ready.",
+                                "content": "Understood — I won't update the PRD without your answer. Ask anything or tell me when to continue.",
                                 "timestamp": datetime.utcnow().isoformat() + "Z",
                                 "message_type": "assistant",
                             },
@@ -1280,6 +1686,20 @@ async def await_human_answer(state: AgentState) -> AgentState:
                             # If unable to find heading line, prepend a new one before body
                             updated = lines[:start] + [f"### {new_heading}", ""] + lines[start:]
                             state.prd_markdown = "\n".join(updated)
+
+                    # Update plan items to reflect new heading display (re-canonicalize)
+                    try:
+                        if isinstance(state.initial_question_plan, list) and state.initial_question_plan:
+                            updated_plan: List[Dict[str, str]] = []
+                            old_key = _canonicalize_heading_key(target_section)
+                            for it in state.initial_question_plan:
+                                sec_disp = it.get("section") or ""
+                                if _canonicalize_heading_key(sec_disp) == old_key:
+                                    it = {**it, "section": new_heading}
+                                updated_plan.append(it)
+                            state.initial_question_plan = _dedup_plan_items(updated_plan)
+                    except Exception:
+                        pass
                     else:
                         # If section not found, append a new one at end
                         state.prd_markdown = _replace_section_body(state.prd_markdown, new_heading, "")
@@ -1496,6 +1916,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
             f"Current PRD (full):\n{state.prd_markdown}\n\n"
             f"Target section: {target_section}\n"
             f"Answer: {latest_one.get('answer','')}\n"
+            + (f"Idea: {state.idea}\n" if (state.idea or "").strip() else "")
             + (f"\nContext (do not copy; use for facts only):\n{rag_ctx}\n" if rag_ctx else "")
         ),
     }
@@ -1550,7 +1971,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
         resp = await ai_service.generate_response(
             user_id=state.user_id,
             messages=[refine_system, refine_user],
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=900,
             use_cache=False,
         )
@@ -1588,7 +2009,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
                 resp2 = await ai_service.generate_response(
                     user_id=state.user_id,
                     messages=[expand_system, expand_user],
-                    temperature=0.3,
+                    temperature=0.2,
                     max_tokens=900,
                     use_cache=False,
                 )
@@ -1634,7 +2055,9 @@ async def incorporate_answer(state: AgentState) -> AgentState:
         pass
     # Recompute section status
     order = state.completion_targets.get("sections", []) if isinstance(state.completion_targets, dict) else []
-    state.sections_status = _compute_sections_status(state.prd_markdown, order)
+    sec_templ, all_status = _compute_sections_statuses(state.prd_markdown, order)
+    state.sections_status = sec_templ
+    state.all_sections_status = all_status
     await _emit({
         "type": "artifacts_preview",
         "data": {

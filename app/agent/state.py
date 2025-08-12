@@ -29,6 +29,7 @@ class AgentState(BaseModel):
     mermaid: str = ""
     thinking_lens_status: Dict[str, bool] = Field(default_factory=dict)
     sections_status: Dict[str, bool] = Field(default_factory=dict)
+    all_sections_status: Dict[str, bool] = Field(default_factory=dict)
     telemetry: Dict[str, Any] = Field(default_factory=dict)
     # Whether to generate a flowchart in this run (initial runs should keep this False)
     generate_flowchart: bool = False
@@ -51,29 +52,27 @@ class AgentState(BaseModel):
             # Section-based completion targets aligned to PRD template
             "sections": [
                 "1. Product Overview / Purpose",
-                "2. Objective and Goals",
+                "2. Objectives & KPIs",
                 "3. User Personas",
-                "4. User Needs & Requirements",
-                "5. Features & Functional Requirements",
+                "4. User Needs",
+                "5. Functional Requirements",
                 "6. Non-Functional Requirements",
-                "7. User Stories / UX Flow / Design Notes",
-                "8. Technical Specifications",
-                "9. Assumptions, Constraints & Dependencies",
-                "10. Timeline & Milestones",
-                "11. Success Metrics / KPIs",
-                "12. Release Criteria",
-                "13. Open Questions / Issues",
-                "14. Budget and Resources",
+                "7. Technical Architecture & Integrations",
+                "8. Risks & Open Questions",
             ],
             # Soft guardrail: do not finish until we've incorporated at least this many answers
             "min_questions_before_finish": 4,
-            "max_questions": 14,
+            "max_questions": 8,
         }
     )
     # Alias to thinking_lens_status for clarity in loop control
     coverage_status: Dict[str, bool] = Field(default_factory=dict)
     # UI overrides (e.g., lens coverage hints) provided by frontend
     ui_overrides: Optional[Dict[str, Any]] = None
+
+    # Initial question plan: one question per template section (Option 2)
+    initial_question_plan: List[Dict[str, str]] = Field(default_factory=list)
+    plan_cursor: int = 0
 
     # Runtime only (not persisted)
     send_event: Optional[Callable[[Dict[str, Any]], Any]] = Field(default=None, exclude=True)

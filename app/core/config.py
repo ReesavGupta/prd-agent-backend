@@ -80,9 +80,10 @@ class Settings(BaseSettings):
     NOMIC_API_KEY: Optional[str] = os.getenv("NOMIC_API_KEY")
     
     # AI Configuration
-    PRIMARY_AI_PROVIDER: str = "gemini"
-    SECONDARY_AI_PROVIDER: str = "groq"
-    TERTIARY_AI_PROVIDER: str = "openai"
+    # Provider priority (agentic tasks): OpenAI → Gemini → Groq
+    PRIMARY_AI_PROVIDER: str = "openai"
+    SECONDARY_AI_PROVIDER: str = "gemini"
+    TERTIARY_AI_PROVIDER: str = "groq"
 
     # Model names (configurable via env)
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")

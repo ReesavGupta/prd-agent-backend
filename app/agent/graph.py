@@ -9,6 +9,7 @@ from app.agent.nodes import (
     generate_mermaid,
     postprocess,
     analyze_gaps,
+    propose_initial_questions,
     propose_next_question,
     await_human_answer,
     incorporate_answer,
@@ -22,6 +23,7 @@ def compile_graph() -> StateGraph:
     builder.add_node("prepare_context", prepare_context)
     builder.add_node("generate_prd", generate_prd)
     builder.add_node("analyze_gaps", analyze_gaps)
+    builder.add_node("propose_initial_questions", propose_initial_questions)
     builder.add_node("propose_next_question", propose_next_question)
     builder.add_node("await_human_answer", await_human_answer)
     builder.add_node("incorporate_answer", incorporate_answer)
@@ -39,11 +41,12 @@ def compile_graph() -> StateGraph:
             tele = getattr(state, "telemetry", {}) or {}
             should_finish = bool(tele.get("should_finish"))
             gen_flow = bool(getattr(state, "generate_flowchart", False))
+            has_plan = bool(getattr(state, "initial_question_plan", []))
             if should_finish and gen_flow:
                 return "finish_flow"
             if should_finish:
                 return "finish"
-            return "continue"
+            return "continue" if has_plan else "plan"
         except Exception:
             return "continue"
 
@@ -54,6 +57,7 @@ def compile_graph() -> StateGraph:
             {
                 "finish": "postprocess",            # finish without flowchart
                 "finish_flow": "generate_mermaid",  # gated flowchart generation
+                "plan": "propose_initial_questions",
                 "continue": "propose_next_question",
             },
         )
@@ -91,6 +95,9 @@ def compile_graph() -> StateGraph:
     # Loop back after answer incorporation
     builder.add_edge("await_human_answer", "incorporate_answer")
     builder.add_edge("incorporate_answer", "analyze_gaps")
+
+    # After emitting a plan, go ask immediately
+    builder.add_edge("propose_initial_questions", "await_human_answer")
 
     # Finalize: flowchart generation is optional/gated by runtime logic; keep edge if invoked
     builder.add_edge("generate_mermaid", "postprocess")
