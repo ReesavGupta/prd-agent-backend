@@ -43,3 +43,4 @@ Short overview.
     assert any(e.get("type") == "artifacts_preview" and (e.get("data") or {}).get("mermaid") for e in events)
 
 
+
