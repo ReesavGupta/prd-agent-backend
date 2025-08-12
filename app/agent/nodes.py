@@ -325,7 +325,6 @@ def _is_valid_question(text: str) -> bool:
     banned = (
         "what is the main",
         "which features",
-        "what 2–3",
         "what 2-3",
         "what are the 2",
         "what is the happy-path",
@@ -361,7 +360,7 @@ def _system_prompt_initial_outline(template_text: str, title: str) -> str:
         + title.replace("\n", " ").strip()
         + "'\n"
         "- Then output ALL sections exactly as in the template below (keep headings verbatim and in order).\n"
-        "- Under EACH section, write 1 short, idea-tailored line grounded ONLY in the user's one‑liner (do not invent specifics).\n"
+        "- Under EACH section, write 1 short, idea-tailored line grounded ONLY in the user's one-liner (do not invent specifics).\n"
         "- Keep each line crisp (<= 20 words) and relevant to the idea; if unknown, write 'TBD — based on idea'.\n"
         "- No code fences. No preface. No postface.\n\n"
         "Template (use these headings verbatim; add the one-liner beneath each):\n\n"
