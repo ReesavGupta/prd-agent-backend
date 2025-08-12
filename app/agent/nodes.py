@@ -6,10 +6,25 @@ from app.agent.state import AgentState
 import logging
 import re
 import json
-from app.services.ai_service import ai_service
-from app.services.rag_service import build_agent_rag_context
+# Lazy service getters to avoid heavy imports during module import time in tests
+def _get_ai():
+    from app.services.ai_service import ai_service  # type: ignore
+    return ai_service
+
+async def _build_agent_rag_context(*, project_id: str, user_id: str, question: str, prd_markdown: str, attachment_file_id: Optional[str] = None) -> str:
+    try:
+        from app.services.rag_service import build_agent_rag_context as _inner  # type: ignore
+    except Exception:
+        return ""
+    return await _inner(
+        project_id=project_id,
+        user_id=user_id,
+        question=question,
+        prd_markdown=prd_markdown,
+        attachment_file_id=attachment_file_id,
+    )
 from app.agent.commands import detect_rename_title, apply_prd_title_rename
-from app.agent.intent import classify_intent, verify_is_answer
+from app.agent.intent import classify_intent, verify_is_answer, map_text_to_section, detect_is_question
 from functools import lru_cache
 from pathlib import Path
 import time
@@ -227,6 +242,231 @@ def _replace_section_body(prd_markdown: str, target_section: str, new_body: str)
     return result
 
 
+async def route_entry(state: AgentState) -> AgentState:
+    """Entry router to prevent outline reset and route by intent when PRD exists.
+
+    Sets state.telemetry["entry_route"] to one of:
+      - "generate_prd" (empty PRD)
+      - "apply_user_instruction" (edit/rename/insert/delete)
+      - "chat_qa_once" (follow-up question)
+      - "propose_or_finalize" (default HITL path)
+    """
+    try:
+        if not (state.prd_markdown or state.base_prd_markdown):
+            state.telemetry = {**(state.telemetry or {}), "entry_route": "generate_prd"}
+            return state
+        # Find last user message content, if any
+        last_msg = ""
+        try:
+            if isinstance(state.last_messages, list):
+                for m in reversed(state.last_messages):
+                    if (m.get("role") or "").strip() == "user":
+                        last_msg = (m.get("content") or "").strip()
+                        break
+        except Exception:
+            last_msg = ""
+        if not last_msg:
+            state.telemetry = {**(state.telemetry or {}), "entry_route": "propose_or_finalize"}
+            return state
+        intent, args = await classify_intent(
+            user_id=state.user_id,
+            user_text=last_msg,
+            section=None,
+            question=None,
+            idea=state.idea,
+            recent_qa=getattr(state, "answered_qa", None),
+        )
+        tele = {**(state.telemetry or {}), "entry_intent": intent, "entry_args": args}
+        if intent in {"update_section_content", "rename_title", "rename_section_heading", "request_section_insert", "request_section_delete"}:
+            tele["entry_route"] = "apply_user_instruction"
+        elif intent == "followup_question":
+            tele["entry_route"] = "chat_qa_once"
+        elif intent == "answer":
+            tele["entry_route"] = "propose_or_finalize"
+        else:
+            tele["entry_route"] = "propose_or_finalize"
+        state.telemetry = tele
+    except Exception:
+        state.telemetry = {**(state.telemetry or {}), "entry_route": "propose_or_finalize"}
+    return state
+
+
+async def apply_user_instruction(state: AgentState) -> AgentState:
+    """Apply a targeted user instruction to update or rename PRD parts without resetting outline."""
+    from app.websocket.publisher import publish_to_chat
+    prd = state.prd_markdown or ""
+    tele = state.telemetry or {}
+    args = tele.get("entry_args") or {}
+    intent = tele.get("entry_intent") or "generic"
+
+    # Helper for emitting events
+    async def emit(evt: Dict[str, Any]) -> None:
+        if callable(getattr(state, "send_event", None)):
+            try:
+                await state.send_event(evt)  # type: ignore
+                return
+            except Exception:
+                pass
+        if getattr(state, "ws_chat_id", None):
+            await publish_to_chat(state.ws_chat_id, evt)  # type: ignore
+
+    try:
+        # Title rename
+        if intent == "rename_title":
+            new_title = (args or {}).get("new_title")
+            if isinstance(new_title, str) and new_title.strip():
+                state.prd_markdown = apply_prd_title_rename(prd, new_title.strip())
+                await emit({"type": "artifacts_preview", "data": {"prd_markdown": state.prd_markdown, "mermaid": None, "sections_status": state.sections_status or {}}})
+                await emit({"type": "ai_response_complete", "data": {"message": "Title updated"}})
+                return state
+
+        # Section heading rename
+        if intent == "rename_section_heading":
+            new_heading = (args or {}).get("new_heading")
+            section_ref = (args or {}).get("section_ref")
+            if isinstance(new_heading, str) and new_heading.strip():
+                target = str(section_ref or "").strip() or new_heading
+                s, e, lines, _found = _find_section_range(prd, target)
+                if s != -1:
+                    head_idx = s - 1
+                    if head_idx >= 0 and lines[head_idx].strip().startswith("###"):
+                        lines[head_idx] = f"### {new_heading.strip()}"
+                        state.prd_markdown = "\n".join(lines)
+                    else:
+                        updated = lines[:s] + [f"### {new_heading.strip()}", ""] + lines[s:]
+                        state.prd_markdown = "\n".join(updated)
+                else:
+                    state.prd_markdown = prd.rstrip() + f"\n\n### {new_heading.strip()}\n\n"
+                await emit({"type": "artifacts_preview", "data": {"prd_markdown": state.prd_markdown, "mermaid": None, "sections_status": state.sections_status or {}}})
+                await emit({"type": "ai_response_complete", "data": {"message": "Section heading updated"}})
+                return state
+
+        # Section content update
+        if intent == "update_section_content":
+            section_ref = (args or {}).get("section_ref")
+            instructions = (args or {}).get("instructions") or ""
+            target = str(section_ref or "").strip()
+            if not target:
+                mapped = await map_text_to_section(state.user_id, prd, instructions)
+                target = mapped.get("section_ref") or "1"
+            # Build RAG context
+            rag_ctx = await _build_agent_rag_context(
+                project_id=state.project_id,
+                user_id=state.user_id,
+                question=instructions,
+                prd_markdown=state.prd_markdown,
+                attachment_file_id=getattr(state, "pending_attachment_file_id", None),
+            )
+            # Existing body
+            try:
+                s_idx, e_idx, lines, _head = _find_section_range(state.prd_markdown, target)
+                existing_body = "\n".join(lines[s_idx:e_idx]).strip() if s_idx != -1 else ""
+            except Exception:
+                existing_body = ""
+            # Ask LLM for BODY ONLY
+            refine_system = {"role": "system", "content": "You update PRDs. Output ONLY the Markdown BODY for the specified section. NO headings, NO backticks, NO preface/postface. Use PRD & context; do not invent facts."}
+            refine_user = {"role": "user", "content": (f"Section: {target}\n\nExisting body:\n{existing_body}\n\nInstructions:\n{instructions}\n\n" + (f"Context (do not copy):\n{rag_ctx}\n" if rag_ctx else ""))}
+            try:
+                resp = await _get_ai().generate_response(user_id=state.user_id, messages=[refine_system, refine_user], temperature=0.2, max_tokens=800, use_cache=False)
+                body = (resp.content or "").strip().strip("`\n ")
+            except Exception:
+                body = instructions
+            state.prd_markdown = _replace_section_body(state.prd_markdown, target, body)
+            await emit({"type": "artifacts_preview", "data": {"prd_markdown": state.prd_markdown, "mermaid": None, "sections_status": state.sections_status or {}}})
+            await emit({"type": "ai_response_complete", "data": {"message": f"Updated section {target}"}})
+            return state
+
+        # Optional: insert/delete section minimal behavior
+        if intent == "request_section_insert":
+            new_heading = (args or {}).get("new_heading") or (args or {}).get("section_ref") or "New Section"
+            state.prd_markdown = (state.prd_markdown or "").rstrip() + f"\n\n### {new_heading}\n\n"
+            await emit({"type": "artifacts_preview", "data": {"prd_markdown": state.prd_markdown, "mermaid": None, "sections_status": state.sections_status or {}}})
+            await emit({"type": "ai_response_complete", "data": {"message": "Section inserted"}})
+            return state
+        if intent == "request_section_delete":
+            target = (args or {}).get("section_ref") or ""
+            if target:
+                s_idx, e_idx, lines, _head = _find_section_range(state.prd_markdown, target)
+                if s_idx != -1:
+                    head_idx = s_idx - 1
+                    if head_idx >= 0 and lines[head_idx].strip().startswith("###"):
+                        new_lines = lines[:head_idx + 1] + [""] + lines[e_idx:]
+                        state.prd_markdown = "\n".join(new_lines)
+                    else:
+                        new_lines = lines[:head_idx] + lines[e_idx:]
+                        state.prd_markdown = "\n".join(new_lines)
+            await emit({"type": "artifacts_preview", "data": {"prd_markdown": state.prd_markdown, "mermaid": None, "sections_status": state.sections_status or {}}})
+            await emit({"type": "ai_response_complete", "data": {"message": "Section updated"}})
+            return state
+
+    except Exception as e:
+        try:
+            await emit({"type": "error", "data": {"message": f"Instruction failed: {e}"}})
+        except Exception:
+            pass
+    return state
+
+
+async def chat_qa_once(state: AgentState) -> AgentState:
+    """Answer a follow-up question with PRD+RAG context without modifying PRD."""
+    from app.websocket.publisher import publish_to_chat
+    # Extract last question
+    last_question = ""
+    try:
+        tele = state.telemetry or {}
+        args = tele.get("entry_args") or {}
+        last_question = (args.get("question") or "").strip()
+        if not last_question and isinstance(state.last_messages, list):
+            for m in reversed(state.last_messages):
+                if (m.get("role") or "").strip() == "user":
+                    last_question = (m.get("content") or "").strip()
+                    break
+    except Exception:
+        last_question = ""
+    if not last_question:
+        return state
+    # Build context
+    ctx = await _build_agent_rag_context(
+        project_id=state.project_id,
+        user_id=state.user_id,
+        question=last_question,
+        prd_markdown=state.prd_markdown,
+        attachment_file_id=getattr(state, "pending_attachment_file_id", None),
+    )
+    # Emit streaming events
+    async def emit(evt: Dict[str, Any]) -> None:
+        if callable(getattr(state, "send_event", None)):
+            try:
+                await state.send_event(evt)  # type: ignore
+                return
+            except Exception:
+                pass
+        if getattr(state, "ws_chat_id", None):
+            await publish_to_chat(state.ws_chat_id, evt)  # type: ignore
+
+    await emit({"type": "stream_start", "data": {"project_id": state.project_id}})
+    last_provider = None
+    last_model = None
+    try:
+        system_msg = {"role": "system", "content": "Use ONLY the provided context to answer the user's question. If the answer is not present, say you don't have enough information. Keep answers brief and specific."}
+        user_msg = {"role": "user", "content": f"Context:\n{ctx or '(no context)'}\n\nQuestion:\n{last_question}"}
+        async for chunk in _get_ai().generate_stream(user_id=state.user_id, messages=[system_msg, user_msg], temperature=0.2, max_tokens=800):
+            if chunk.is_complete:
+                await emit({"type": "ai_response_streaming", "data": {"delta": "", "is_complete": True, "provider": chunk.provider, "model": chunk.model}})
+                last_provider = chunk.provider
+                last_model = chunk.model
+                break
+            delta = chunk.content or ""
+            last_provider = chunk.provider
+            last_model = chunk.model
+            await emit({"type": "ai_response_streaming", "data": {"delta": delta, "is_complete": False, "provider": chunk.provider, "model": chunk.model}})
+    except Exception as e:
+        await emit({"type": "error", "data": {"message": f"Generation failed: {e}"}})
+        return state
+    await emit({"type": "ai_response_complete", "data": {"message": "", "provider": last_provider, "model": last_model}})
+    return state
+
+
 def _section_to_lens(section: str) -> str:
     key = _canonicalize_heading_key(section)
     if key.startswith("1. "):
@@ -408,7 +648,7 @@ async def generate_prd(state: AgentState) -> AgentState:
     start_time = time.time()
     # Simple pacing for artifacts_preview
     last_emit_len = 0
-    async for chunk in ai_service.generate_stream(
+    async for chunk in _get_ai().generate_stream(
         user_id=state.user_id,
         messages=messages,
         temperature=0.2,
@@ -540,7 +780,7 @@ async def generate_mermaid(state: AgentState) -> AgentState:
     async def _gen_from_prd(prd: str) -> str:
         sm = {"role": "system", "content": owner_prompt}
         um = {"role": "user", "content": user_content.replace(prd_text, prd, 1)}
-        resp = await ai_service.generate_response(
+        resp = await _get_ai().generate_response(
             user_id=state.user_id,
             messages=[sm, um],
             temperature=0.2,
@@ -551,7 +791,7 @@ async def generate_mermaid(state: AgentState) -> AgentState:
 
     # Try direct generation; on provider error (e.g., length), summarize PRD and retry once
     try:
-        response = await ai_service.generate_response(
+        response = await _get_ai().generate_response(
             user_id=state.user_id,
             messages=[system_msg, user_msg],
             temperature=0.2,
@@ -572,7 +812,7 @@ async def generate_mermaid(state: AgentState) -> AgentState:
                 ),
             }
             sum_user = {"role": "user", "content": prd_text[:24000]}
-            sum_resp = await ai_service.generate_response(
+            sum_resp = await _get_ai().generate_response(
                 user_id=state.user_id,
                 messages=[sum_system, sum_user],
                 temperature=0.0,
@@ -640,7 +880,7 @@ async def generate_mermaid(state: AgentState) -> AgentState:
           ),
       }
       try:
-        retry_resp = await ai_service.generate_response(
+        retry_resp = await _get_ai().generate_response(
             user_id=state.user_id,
             messages=[retry_system, retry_user],
             temperature=0.1,
@@ -806,7 +1046,7 @@ async def propose_initial_questions(state: AgentState) -> AgentState:
 
     questions_by_key: Dict[str, str] = {}
     try:
-        resp = await ai_service.generate_response(
+        resp = await _get_ai().generate_response(
             user_id=state.user_id,
             messages=[sys, usr],
             temperature=0.2,
@@ -850,7 +1090,7 @@ async def propose_initial_questions(state: AgentState) -> AgentState:
                     ),
                 }
                 single_usr = {"role": "user", "content": f"Idea: {idea_text}\nSection: {title}\nKey phrases: {', '.join(terms)}"}
-                r = await ai_service.generate_response(
+                r = await _get_ai().generate_response(
                     user_id=state.user_id,
                     messages=[single_sys, single_usr],
                     temperature=0.2,
@@ -976,7 +1216,7 @@ async def propose_next_question(state: AgentState) -> AgentState:
                     "Avoid generic phrasing. ≤ 150 chars. End with '?'."
                 )}
                 single_usr = {"role": "user", "content": f"Idea: {idea_text}\nSection: {display}\nKey phrases: {', '.join(terms)}"}
-                r = await ai_service.generate_response(
+                r = await _get_ai().generate_response(
                     user_id=state.user_id,
                     messages=[single_sys, single_usr],
                     temperature=0.2,
@@ -1140,7 +1380,7 @@ async def propose_next_question(state: AgentState) -> AgentState:
             if qa_lines:
                 ctx_parts.append("Recent answers:\n" + "\n".join(qa_lines))
         usr = {"role": "user", "content": "\n\n".join(ctx_parts)}
-        resp = await ai_service.generate_response(
+        resp = await _get_ai().generate_response(
             user_id=state.user_id,
             messages=[sys, usr],
             temperature=0.2,
@@ -1185,7 +1425,7 @@ async def propose_next_question(state: AgentState) -> AgentState:
             if terms:
                 usr2_ctx.append("Idea key phrases: " + ", ".join(terms))
             usr2 = {"role": "user", "content": "\n".join(usr2_ctx)}
-            resp2 = await ai_service.generate_response(
+            resp2 = await _get_ai().generate_response(
                 user_id=state.user_id,
                 messages=[sys2, usr2],
                 temperature=0.2,
@@ -1725,10 +1965,79 @@ async def await_human_answer(state: AgentState) -> AgentState:
                 except Exception:
                     pass
 
-            # Not in confirm mode yet → classify as answer vs generic using LLM outcome first and a verifier
+            # Not in confirm mode yet → classify as answer vs question vs edit vs off-topic
+            if intent == "followup_question":
+                # Answer the question briefly with RAG; then ask to proceed with pending section
+                try:
+                    ctx = await _build_agent_rag_context(
+                        project_id=state.project_id,
+                        user_id=state.user_id,
+                        question=(user_text or (args or {}).get("question") or ""),
+                        prd_markdown=state.prd_markdown,
+                        attachment_file_id=state.pending_attachment_file_id,
+                    )
+                except Exception:
+                    ctx = ""
+                sys = {"role": "system", "content": "Use ONLY the provided context to answer the user's question. Be brief and specific. If unknown, say so."}
+                usr = {"role": "user", "content": f"Context:\n{ctx or '(no context)'}\n\nQuestion:\n{(args or {}).get('question') or user_text}"}
+                try:
+                    resp = await _get_ai().generate_response(user_id=state.user_id, messages=[sys, usr], temperature=0.2, max_tokens=800)
+                    brief = (resp.content or "").strip()
+                except Exception:
+                    brief = "I don't have enough information to answer that right now."
+                if state.ws_chat_id:
+                    await publish_to_chat(state.ws_chat_id, {
+                        "type": "message_sent",
+                        "data": {
+                            "message_id": f"g:{int(time.time()*1000)}",
+                            "user_id": state.user_id,
+                            "content": brief,
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "message_type": "assistant",
+                        },
+                    })
+                # Ask permission to proceed with original section question
+                proceed_text = f"Would you like to proceed with the PRD question for '{sec}' now?"
+                if state.ws_chat_id:
+                    await publish_to_chat(state.ws_chat_id, {
+                        "type": "message_sent",
+                        "data": {
+                            "message_id": f"p:{qid}",
+                            "user_id": state.user_id,
+                            "content": proceed_text,
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "message_type": "assistant",
+                        },
+                    })
+                state.pending_question_kind = "confirm"
+                state.pending_question = {"id": qid, "question": f"Proceed with section '{sec}'?", "section": sec, "rationale": "Confirm before resuming PRD updates."}
+                current = interrupt({"type": "confirm", "question_id": qid, "section": sec})
+                continue
+
+            if intent == "update_section_content":
+                # Inline edit while paused: reuse apply_user_instruction behavior
+                state.telemetry = {**(state.telemetry or {}), "entry_intent": intent, "entry_args": (args or {})}
+                state = await apply_user_instruction(state)
+                # After updating, ask to proceed to next question
+                if state.ws_chat_id:
+                    await publish_to_chat(state.ws_chat_id, {
+                        "type": "message_sent",
+                        "data": {
+                            "message_id": f"n:{int(time.time()*1000)}",
+                            "user_id": state.user_id,
+                            "content": "Updated the section. Proceed to the next question?",
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "message_type": "assistant",
+                        },
+                    })
+                state.pending_question_kind = "confirm"
+                state.pending_question = {"id": qid, "question": f"Proceed with section '{sec}'?", "section": sec, "rationale": "Confirm before resuming PRD updates."}
+                current = interrupt({"type": "confirm", "question_id": qid, "section": sec})
+                continue
+
+            # Otherwise, decide if it's a direct answer
             is_answer = (intent == "answer")
             if not is_answer:
-                # Ask the LLM to verify strictly if it's an answer
                 is_answer = await verify_is_answer(state.user_id, user_text, sec or "", qtxt or "")
             if is_answer or _looks_like_direct_answer(user_text, sec or "", qtxt or ""):
                 state.answered_qa.append({
@@ -1746,11 +2055,11 @@ async def await_human_answer(state: AgentState) -> AgentState:
                 state.pending_question_kind = None
                 return state
 
-            # Generic: answer briefly, then request permission to proceed
+            # Generic: decide if it is a question; if yes, answer; else ask to clarify; then request permission to proceed
             if state.ws_chat_id and user_text:
                 # Build agent-mode RAG context similar to chat mode
                 try:
-                    ctx = await build_agent_rag_context(
+                    ctx = await _build_agent_rag_context(
                         project_id=state.project_id,
                         user_id=state.user_id,
                         question=user_text,
@@ -1759,35 +2068,28 @@ async def await_human_answer(state: AgentState) -> AgentState:
                     )
                 except Exception:
                     ctx = ""
-                sys = {
-                    "role": "system",
-                    "content": (
-                        "You are a concise product assistant. Use ONLY the provided context to answer the user's question. "
-                        "If the answer is not present, say you don't have enough information. Keep answers brief and specific."
-                    ),
-                }
-                usr = {"role": "user", "content": f"Context:\n{ctx or '(no context)'}\n\nQuestion:\n{user_text}"}
+                # Detect question-like text to decide answer vs clarify
                 try:
-                    # Log state snapshot and question for observability
-                    try:
-                        logging.getLogger(__name__).info(
-                            "[AGENT_RAG] generic_reply qlen=%d attach=%s state_snapshot=%s",
-                            len(user_text or ""),
-                            (state.pending_attachment_file_id[:8] + '…') if state.pending_attachment_file_id else None,
-                            json.dumps({
-                                "project_id": state.project_id,
-                                "chat_id": state.chat_id,
-                                "user_id": state.user_id,
-                                "pending_question": bool(state.pending_question),
-                                "last_section_qid": state.last_section_qid,
-                            }, default=str)[:500]
-                        )
-                    except Exception:
-                        pass
-                    resp = await ai_service.generate_response(user_id=state.user_id, messages=[sys, usr], temperature=0.2, max_tokens=4000)
-                    brief = (resp.content or "").strip()
+                    is_q = await detect_is_question(state.user_id, user_text)
                 except Exception:
-                    brief = "Got it."
+                    is_q = user_text.endswith("?")
+                brief = ""
+                if is_q:
+                    sys = {
+                        "role": "system",
+                        "content": (
+                            "You are a concise product assistant. Use ONLY the provided context to answer the user's question. "
+                            "If the answer is not present, say you don't have enough information. Keep answers brief and specific."
+                        ),
+                    }
+                    usr = {"role": "user", "content": f"Context:\n{ctx or '(no context)'}\n\nQuestion:\n{user_text}"}
+                    try:
+                        resp = await _get_ai().generate_response(user_id=state.user_id, messages=[sys, usr], temperature=0.2, max_tokens=800)
+                        brief = (resp.content or "").trim() if hasattr(resp.content, 'trim') else (resp.content or "").strip()
+                    except Exception:
+                        brief = "I don't have enough information to answer that yet."
+                else:
+                    brief = "Could you please clarify what you want me to do? If it's a question, feel free to ask it directly."
                 await publish_to_chat(state.ws_chat_id, {
                     "type": "message_sent",
                     "data": {
@@ -1882,7 +2184,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
     }
     # Build a compact RAG context to improve factual grounding for this section
     try:
-        rag_ctx = await build_agent_rag_context(
+        rag_ctx = await _build_agent_rag_context(
             project_id=state.project_id,
             user_id=state.user_id,
             question=(latest_one.get('question','') or target_section),
@@ -1927,22 +2229,12 @@ async def incorporate_answer(state: AgentState) -> AgentState:
     except Exception:
         existing_body = ""
 
-    style_hints: Dict[str, str] = {
-        "1. Product Overview / Purpose": "Write 1–2 short paragraphs (<= 120 words total). State product, primary value, and primary audience.",
-        "2. Objective and Goals": "Write 2–4 bullet points. Each goal must be concrete and measurable (include a target and timeframe where possible).",
-        "3. User Personas": "Write 1–2 concise personas with bullets: key traits, goals, pain points, context. Use respectful, neutral language.",
-        "4. User Needs & Requirements": "Write 5–8 bullet points of user needs/problems (not solutions). Keep each bullet crisp.",
-        "5. Features & Functional Requirements": "Write 5–8 bullets, each naming a feature and its outcome. Keep neutral, no fluff.",
-        "6. Non-Functional Requirements": "Write bullets for performance, reliability, security, privacy, accessibility. Add sensible targets where possible.",
-        "7. User Stories / UX Flow / Design Notes": "Write a short happy-path flow as numbered steps (5–8) and any key design notes.",
-        "8. Technical Specifications": "List stack/integrations/constraints as bullets. Keep practical and specific.",
-        "9. Assumptions, Constraints & Dependencies": "List assumptions and constraints as bullets. Mention external dependencies.",
-        "10. Timeline & Milestones": "Write 3–5 milestones with rough timing (e.g., Week 2, Week 6, Launch).",
-        "11. Success Metrics / KPIs": "List 3–5 primary metrics plus any guardrails.",
-        "12. Release Criteria": "Bullet list of must-pass checks for launch: functionality, performance, reliability, support.",
-        "13. Open Questions / Issues": "List 3–7 decisions/risks to resolve.",
-        "14. Budget and Resources": "Brief bullets for team roles and budget bands if known.",
-    }
+    # Style hints externalized to config to avoid hardcoding here
+    try:
+        from app.core.config import settings  # type: ignore
+        style_hints: Dict[str, str] = dict(getattr(settings, 'PRD_SECTION_STYLE_HINTS', {}) or {})
+    except Exception:
+        style_hints = {}
 
     refine_system = {
         "role": "system",
@@ -1967,7 +2259,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
 
     try:
         # First attempt: concise rewrite
-        resp = await ai_service.generate_response(
+        resp = await _get_ai().generate_response(
             user_id=state.user_id,
             messages=[refine_system, refine_user],
             temperature=0.2,
@@ -2005,7 +2297,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
                         + (f"\nContext (facts only):\n{rag_ctx}\n" if rag_ctx else "")
                     ),
                 }
-                resp2 = await ai_service.generate_response(
+                resp2 = await _get_ai().generate_response(
                     user_id=state.user_id,
                     messages=[expand_system, expand_user],
                     temperature=0.2,
@@ -2085,7 +2377,7 @@ async def incorporate_answer(state: AgentState) -> AgentState:
         }
         last_provider: str | None = None
         last_model: str | None = None
-        async for chunk in ai_service.generate_stream(
+        async for chunk in _get_ai().generate_stream(
             user_id=state.user_id,
             messages=[ack_system, ack_user],
             temperature=0.2,

@@ -3,7 +3,7 @@ Application configuration management using Pydantic Settings.
 Handles environment-based configuration for database connections, JWT secrets, and other settings.
 """
 import os
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
 import secrets
@@ -98,6 +98,24 @@ class Settings(BaseSettings):
     AI_MAX_TOKENS: int = 4000
     AI_TEMPERATURE: float = 0.7
     AI_TIMEOUT_SECONDS: int = 60
+
+    # PRD Section style hints (externalized from agent code to avoid hardcoding in logic)
+    PRD_SECTION_STYLE_HINTS: Dict[str, str] = {
+        "1. Product Overview / Purpose": "Write 1–2 short paragraphs (<= 120 words total). State product, primary value, and primary audience.",
+        "2. Objective and Goals": "Write 2–4 bullet points. Each goal must be concrete and measurable (include a target and timeframe where possible).",
+        "3. User Personas": "Write 1–2 concise personas with bullets: key traits, goals, pain points, context. Use respectful, neutral language.",
+        "4. User Needs & Requirements": "Write 5–8 bullet points of user needs/problems (not solutions). Keep each bullet crisp.",
+        "5. Features & Functional Requirements": "Write 5–8 bullets, each naming a feature and its outcome. Keep neutral, no fluff.",
+        "6. Non-Functional Requirements": "Write bullets for performance, reliability, security, privacy, accessibility. Add sensible targets where possible.",
+        "7. User Stories / UX Flow / Design Notes": "Write a short happy-path flow as numbered steps (5–8) and any key design notes.",
+        "8. Technical Specifications": "List stack/integrations/constraints as bullets. Keep practical and specific.",
+        "9. Assumptions, Constraints & Dependencies": "List assumptions and constraints as bullets. Mention external dependencies.",
+        "10. Timeline & Milestones": "Write 3–5 milestones with rough timing (e.g., Week 2, Week 6, Launch).",
+        "11. Success Metrics / KPIs": "List 3–5 primary metrics plus any guardrails.",
+        "12. Release Criteria": "Bullet list of must-pass checks for launch: functionality, performance, reliability, support.",
+        "13. Open Questions / Issues": "List 3–7 decisions/risks to resolve.",
+        "14. Budget and Resources": "Brief bullets for team roles and budget bands if known.",
+    }
 
     # PRD summary cache TTLs (seconds)
     PRD_SUMMARY_TTL_SECONDS: int = int(os.getenv("PRD_SUMMARY_TTL_SECONDS", str(24*3600)))

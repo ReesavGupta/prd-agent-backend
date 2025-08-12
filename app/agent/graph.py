@@ -13,6 +13,10 @@ from app.agent.nodes import (
     propose_next_question,
     await_human_answer,
     incorporate_answer,
+    # New nodes for entry routing and single-turn behaviors
+    route_entry,
+    apply_user_instruction,
+    chat_qa_once,
 )
 from app.agent.checkpoint import get_checkpointer
 from typing import Any
@@ -21,6 +25,7 @@ from typing import Any
 def compile_graph() -> StateGraph:
     builder = StateGraph(AgentState)
     builder.add_node("prepare_context", prepare_context)
+    builder.add_node("route_entry", route_entry)
     builder.add_node("generate_prd", generate_prd)
     builder.add_node("analyze_gaps", analyze_gaps)
     builder.add_node("propose_initial_questions", propose_initial_questions)
@@ -29,9 +34,40 @@ def compile_graph() -> StateGraph:
     builder.add_node("incorporate_answer", incorporate_answer)
     builder.add_node("generate_mermaid", generate_mermaid)
     builder.add_node("postprocess", postprocess)
+    builder.add_node("apply_user_instruction", apply_user_instruction)
+    builder.add_node("chat_qa_once", chat_qa_once)
 
     builder.add_edge(START, "prepare_context")
-    builder.add_edge("prepare_context", "generate_prd")
+    builder.add_edge("prepare_context", "route_entry")
+    # Conditional routing after route_entry based on telemetry hint
+    def route_after_entry(state: Any) -> str:
+        try:
+            tele = getattr(state, "telemetry", {}) or {}
+            hint = str(tele.get("entry_route") or "").strip() or "propose_or_finalize"
+            if hint == "generate_prd":
+                return "gen"
+            if hint == "apply_user_instruction":
+                return "apply"
+            if hint == "chat_qa_once":
+                return "qa"
+            return "hitl"
+        except Exception:
+            return "hitl"
+
+    try:
+        builder.add_conditional_edges(
+            "route_entry",
+            route_after_entry,
+            {
+                "gen": "generate_prd",
+                "apply": "apply_user_instruction",
+                "qa": "chat_qa_once",
+                "hitl": "analyze_gaps",
+            },
+        )
+    except Exception:
+        # Fallback: continue to analyze_gaps if conditional edges unsupported
+        builder.add_edge("route_entry", "analyze_gaps")
     # HITL loop: PRD -> analyze -> propose/finish -> [await -> incorporate -> analyze]* -> finalize
     builder.add_edge("generate_prd", "analyze_gaps")
 
