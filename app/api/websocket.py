@@ -65,9 +65,13 @@ async def websocket_chat_endpoint(
                 except json.JSONDecodeError:
                     await websocket_manager._send_error(websocket, "Invalid JSON format")
                     continue
+                except WebSocketDisconnect:
+                    # Client disconnected; exit receive loop cleanly
+                    break
                 except Exception as e:
+                    # Likely disconnected/closed; avoid tight error loop
                     logger.error(f"Error receiving WebSocket message: {e}")
-                    continue
+                    break
                 
                 # Handle message
                 await websocket_manager.handle_message(websocket, message_data)

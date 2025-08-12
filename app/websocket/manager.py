@@ -173,8 +173,13 @@ class WebSocketManager:
             self.connection_sessions.pop(websocket, None)
             
             # Delete session from database
+            # Only delete when the underlying connection is truly closed (normal flow).
+            # Defensive: wrap to avoid cascading errors during navigation.
             if session_id:
-                await chat_service.session_repo.delete_session(session_id)
+                try:
+                    await chat_service.session_repo.delete_session(session_id)
+                except Exception:
+                    pass
             
             logger.info(f"WebSocket disconnected for user {user_id} in chat {chat_id}")
             

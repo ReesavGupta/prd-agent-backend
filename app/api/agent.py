@@ -20,6 +20,7 @@ from app.dependencies import get_project_service
 from app.agent.runtime import resume_run
 from app.core.config import settings
 from app.services.cache_service import cache_service
+from app.services.ai_service import AIProvider
 
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -394,4 +395,144 @@ async def save_artifacts(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save artifacts: {str(e)}")
+
+
+# ----------------------
+# Schema generation (HTTP, non-streaming)
+# ----------------------
+
+from pydantic import BaseModel
+
+
+class GenerateSchemaRequest(BaseModel):
+    prd_markdown: str
+    preferred_provider: str | None = None  # "openai" | "gemini" | "groq"
+    model: str | None = None               # default: gpt-4o-mini when openai
+    temperature: float | None = 0.5
+
+
+class GenerateSchemaResponse(BaseModel):
+    schema_markdown: str
+    provider: str
+    model: str | None = None
+    response_time_ms: int | None = None
+
+
+@router.post("/projects/{project_id}/generate-schema", status_code=status.HTTP_200_OK)
+async def generate_schema(
+    project_id: str,
+    payload: GenerateSchemaRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Generate a structured product schema (Markdown) from the current PRD text.
+
+    - Requires non-empty `prd_markdown` provided by the frontend (unsaved editor content allowed)
+    - Provider order: OpenAI → Gemini → Groq
+    - Default: OpenAI gpt-4o-mini, temperature 0.5
+    - On provider failure/context overflow, fall back to next provider
+    """
+    try:
+        prd_md = (payload.prd_markdown or "").strip()
+        if not prd_md:
+            raise HTTPException(status_code=422, detail="Please generate or edit your PRD before generating a schema.")
+
+        # Build messages for schema extraction
+        system_prompt = (
+            "You are a senior product analyst. Read the full PRD and output a structured schema in Markdown.\n"
+            "Rules:\n"
+            "- Output ONLY Markdown (no code fences) with clear sections and subsections.\n"
+            "- Include top-level headings for:\n"
+            "  1. Domain\n"
+            "  2. Core Entities (these can be heading 3)\n"
+            "  4. User Roles\n"
+            "  5. Key Workflows\n"
+            "  6. Data Model (tables in Markdown with columns: Field Name, Type, Description, Constraints)\n"
+            "  7. External Integrations\n"
+            "  8. Non-Functional Constraints\n"
+            "  9. Open Risks\n"
+            "- In Data Model, create one table per entity.\n"
+            "- Keep it concise and concrete.\n"
+            "- If information is missing, write '(unspecified)'.\n"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"PRD (full):\n{prd_md}"},
+        ]
+
+        # Preferred order: OpenAI → Gemini → Groq, filtered by availability
+        order = [AIProvider.OPENAI, AIProvider.GEMINI, AIProvider.GROQ]
+        preferred = (payload.preferred_provider or "openai").lower().strip()
+        # If a preferred provider is specified, bump it to front if known
+        try:
+            pref_enum = AIProvider(preferred)
+            order = [pref_enum] + [p for p in order if p != pref_enum]
+        except Exception:
+            pass
+
+        # Filter to only initialized providers
+        available = [p for p in order if p in getattr(ai_service, "models", {})]
+        if not available:
+            raise HTTPException(status_code=503, detail="No AI providers are configured for schema generation")
+
+        # Provider-specific model defaults
+        openai_model = (payload.model or "gpt-4o-mini") if AIProvider.OPENAI in available else None
+        temp = 0.5 if payload.temperature is None else float(payload.temperature)
+
+        import time
+        last_error: Exception | None = None
+        for provider in available:
+            try:
+                start = time.time()
+                # Apply model/temperature where supported
+                model_name = None
+                if provider == AIProvider.OPENAI and openai_model:
+                    try:
+                        ai_service.models[provider].model = openai_model  # type: ignore[attr-defined]
+                        model_name = openai_model
+                    except Exception:
+                        # fallback: extract model field name variants
+                        try:
+                            setattr(ai_service.models[provider], "model_name", openai_model)
+                            model_name = openai_model
+                        except Exception:
+                            model_name = getattr(ai_service.models[provider], "model", None) or getattr(ai_service.models[provider], "model_name", None)
+                # temperature
+                try:
+                    ai_service.models[provider].temperature = temp  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+                # Build and invoke the chain directly for the provider
+                chain = ai_service.chains.get(provider)
+                if chain is None:
+                    raise RuntimeError(f"Provider {provider.value} is not available")
+
+                content = await chain.ainvoke({"messages": messages})
+                elapsed_ms = int((time.time() - start) * 1000)
+
+                schema_text = (content or "").strip()
+                if not schema_text:
+                    raise RuntimeError("Empty schema response")
+                return BaseResponse.success(data=GenerateSchemaResponse(
+                    schema_markdown=schema_text,
+                    provider=provider.value,
+                    model=model_name or getattr(ai_service.models[provider], 'model', getattr(ai_service.models[provider], 'model_name', None)),
+                    response_time_ms=elapsed_ms,
+                ))
+            except Exception as e:
+                last_error = e
+                # try next provider
+                continue
+
+        # If all providers failed
+        msg = "Failed to generate schema from PRD"
+        if last_error:
+            msg = f"{msg}: {last_error}"
+        raise HTTPException(status_code=503, detail=msg)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Schema generation error: {str(e)}")
 

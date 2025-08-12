@@ -473,13 +473,13 @@ async def generate_mermaid(state: AgentState) -> AgentState:
         "Your goal is to take a PRD.md file and produce a valid Mermaid `flowchart TD` diagram that faithfully "
         "represents the process, systems, and interactions described.\n\n"
         "Follow these rules and guidelines:\n\n"
-        "1. Purpose – read the PRD, identify actors/systems/agents/processes/states/data flows; produce a clear top-down diagram.\n"
-        "2. Structure – use Mermaid `flowchart TD`; group nodes with subgraphs; include user actions, system processes, and data persistence nodes; include loops/branches if described; reflect happy path and key secondary flows.\n"
-        "3. Filling Gaps – make minimal, obvious assumptions only to maintain continuity (e.g., input validation).\n"
-        "4. Accuracy – reflect actual structure/order; use PRD terminology; keep component names consistent with the PRD.\n"
-        "5. Readability – concise node names; directional arrows; use labeled edges where helpful; split into subgraphs for clarity.\n"
-        "6. Output Requirements – ONLY output Mermaid code enclosed in triple backticks as ```mermaid ... ```; ensure valid syntax that renders.\n"
-        "7. Tone – choose clarity over complexity; resolve minor ambiguities pragmatically."
+        "1. Purpose- read the PRD, identify actors/systems/agents/processes/states/data flows; produce a clear top-down diagram.\n"
+        "2. Structure- use Mermaid `flowchart TD`; group nodes with subgraphs; include user actions, system processes, and data persistence nodes; include loops/branches if described; reflect happy path and key secondary flows.\n"
+        "3. Filling Gaps- make minimal, obvious assumptions only to maintain continuity (e.g., input validation).\n"
+        "4. Accuracy- reflect actual structure/order; use PRD terminology; keep component names consistent with the PRD.\n"
+        "5. Readability- concise node names; directional arrows; use labeled edges where helpful; split into subgraphs for clarity.\n"
+        "6. Output Requirements- ONLY output Mermaid code enclosed in triple backticks as ```mermaid ... ```; ensure valid syntax that renders.\n"
+        "7. Tone- choose clarity over complexity; resolve minor ambiguities pragmatically."
     )
 
     prior_mermaid = (state.base_mermaid or "").strip()
