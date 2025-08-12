@@ -99,6 +99,59 @@ class ProjectService:
         
         return self._project_to_response(project)
 
+    async def get_current_artifacts(self, project_id: str, user_id: str) -> Dict[str, Optional[str]]:
+        """Load current PRD and flowchart artifacts from storage."""
+        try:
+            # Verify project ownership
+            project = await self.project_repository.get_project(project_id, user_id)
+            if not project:
+                raise HTTPException(status_code=404, detail="Project not found")
+            
+            storage = self.project_repository.file_storage
+            folder_current = f"{project.storage_path}/current"
+            
+            # Try to load PRD and flowchart
+            prd_content = None
+            flowchart_content = None
+            
+            try:
+                prd_data = await storage.download_file(
+                    filename="prd.md",
+                    folder_path=folder_current
+                )
+                if prd_data:
+                    prd_content = prd_data.decode("utf-8")
+            except Exception:
+                # File may not exist yet
+                pass
+            
+            try:
+                flowchart_data = await storage.download_file(
+                    filename="flowchart.mmd", 
+                    folder_path=folder_current
+                )
+                if flowchart_data:
+                    flowchart_content = flowchart_data.decode("utf-8")
+            except Exception:
+                # File may not exist yet
+                pass
+            
+            return {
+                "prd_markdown": prd_content,
+                "mermaid": flowchart_content,
+                "project_name": project.project_name,
+                "initial_idea": project.initial_idea,
+                "current_version": project.current_version
+            }
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to load current artifacts: {str(e)}"
+            )
+
     async def update_project(
         self,
         project_id: str,

@@ -92,6 +92,43 @@ class CloudinaryStorageRepository(FileStorageRepository):
         except Exception as e:
             raise Exception(f"Failed to generate file URL: {str(e)}")
 
+    async def download_file(self, filename: str, folder_path: str) -> Optional[bytes]:
+        """Download file content from Cloudinary."""
+        try:
+            # Build the public_id from folder path and filename
+            full_folder = f"{settings.CLOUDINARY_FOLDER_PREFIX}/{folder_path}"
+            
+            # For saved artifacts, the public_id should match what was uploaded
+            # Remove extension from filename to match upload pattern
+            name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+            
+            # Try to find the file - since we don't have the hash, we need to list files in the folder
+            files = await self.list_files(folder_path)
+            
+            # Find matching file by checking if the filename starts with our expected name
+            target_file = None
+            for file_info in files:
+                public_id = file_info["storage_key"]
+                # Extract the filename part from the public_id
+                file_basename = public_id.split('/')[-1]
+                if file_basename.startswith(name_without_ext) or file_basename == filename:
+                    target_file = file_info
+                    break
+            
+            if not target_file:
+                return None
+                
+            # Download the file content using the Cloudinary API
+            import requests
+            response = requests.get(target_file["url"])
+            if response.status_code == 200:
+                return response.content
+            else:
+                return None
+                
+        except Exception:
+            return None
+
     async def copy_file(self, source_key: str, destination_key: str) -> bool:
         """Copy file within Cloudinary."""
         try:

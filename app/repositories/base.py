@@ -62,6 +62,20 @@ class FileStorageRepository(ABC):
         pass
 
     @abstractmethod
+    async def download_file(self, filename: str, folder_path: str) -> Optional[bytes]:
+        """
+        Download file content from storage.
+        
+        Args:
+            filename: The filename to download
+            folder_path: Storage folder path
+            
+        Returns:
+            File content as bytes, or None if file doesn't exist
+        """
+        pass
+
+    @abstractmethod
     async def copy_file(self, source_key: str, destination_key: str) -> bool:
         """
         Copy a file within storage.
